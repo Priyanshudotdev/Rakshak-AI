@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rakshak AI - Emergency Intelligence & Dispatch System</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="https://unpkg.com/@phosphor-icons/web@2.1.1"></script>
+</head>
+<body>
+  <a class="skip" href="#workspace">Skip to incident workspace</a>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <p class="brand-kicker">Nagpur Police · 112 Command</p>
+        <h1>Rakshak AI</h1>
+      </div>
+    </div>
+
+    <!-- Navigation Tabs -->
+    <nav class="nav-tabs" aria-label="Main Navigation">
+      <button type="button" class="tab-btn active" data-tab="live-tab" id="tab-btn-live">
+        <i class="ph ph-broadcast" aria-hidden="true"></i>
+        <span>Live Dispatch</span>
+      </button>
+      <button type="button" class="tab-btn" data-tab="records-tab" id="tab-btn-records">
+        <i class="ph ph-database" aria-hidden="true"></i>
+        <span>Incident Records</span>
+        <span class="badge-pill" id="records-count-badge">0</span>
+      </button>
+      <button type="button" class="tab-btn" data-tab="analytics-tab" id="tab-btn-analytics">
+        <i class="ph ph-chart-polar" aria-hidden="true"></i>
+        <span>Intelligence & Analytics</span>
+      </button>
+    </nav>
+
+    <div class="topbar-status">
+      <span class="live-dot" aria-hidden="true"></span>
+      <span>112 Copilot Live</span>
+      <time id="clock" datetime=""></time>
+    </div>
+  </header>
+
+  <!-- TAB 1: LIVE INTAKE & DISPATCH -->
+  <main id="live-tab" class="tab-view active">
+    <div class="board">
+      <aside class="panel intake" aria-labelledby="intake-heading">
+        <h2 id="intake-heading">Call Intake</h2>
+
+        <section class="block">
+          <h3>Live Voice Stream</h3>
+          <div class="record-row">
+            <button type="button" id="record-btn" class="btn btn-accent">
+              <i class="ph ph-microphone" aria-hidden="true"></i>
+              Record
+            </button>
+            <span id="record-timer" class="mono timer">00:00 / 00:25</span>
+          </div>
+          <p class="hint">Live browser mic. Auto-transcribed &amp; translated via Sarvam AI.</p>
+        </section>
+
+        <section class="block">
+          <h3>Audio File (Drag &amp; Drop)</h3>
+          <div class="audio-dropzone" id="audio-dropzone" tabindex="0" role="button" aria-label="Drop audio file here or click to upload">
+            <input id="audio-file" type="file" accept="audio/*,.webm,.wav,.mp3,.m4a,.ogg" hidden>
+            <div class="dropzone-icon">
+              <i class="ph ph-cloud-arrow-up" aria-hidden="true"></i>
+            </div>
+            <div class="dropzone-text">
+              <span class="dropzone-primary">Drag &amp; drop audio file here</span>
+              <span class="dropzone-sub">or click to browse from device</span>
+            </div>
+            <p id="audio-name" class="dropzone-file-status">WAV, MP3, M4A, OGG, or WebM (up to 10MB)</p>
+          </div>
+        </section>
+
+        <section class="block">
+          <h3>Paste Call Transcript</h3>
+          <label class="sr-only" for="call-transcript">Emergency call transcript</label>
+          <textarea id="call-transcript" placeholder="Paste Marathi, Hindi, or English transcript..."></textarea>
+          <button type="button" id="process-text-btn" class="btn btn-accent">
+            <i class="ph ph-cpu" aria-hidden="true"></i>
+            Process Transcript
+          </button>
+        </section>
+      </aside>
+
+      <section id="workspace" class="workspace" aria-labelledby="workspace-heading">
+        <h2 id="workspace-heading" class="sr-only">Incident workspace</h2>
+
+        <ol class="pipeline" id="pipeline" aria-label="Processing stages">
+          <li data-stage="detect"><span>Detect</span></li>
+          <li data-stage="transcribe"><span>Transcribe</span></li>
+          <li data-stage="translate"><span>Translate</span></li>
+          <li data-stage="extract"><span>Extract</span></li>
+          <li data-stage="tts"><span>Voice (TTS)</span></li>
+          <li data-stage="priority"><span>Priority</span></li>
+        </ol>
+
+        <p id="status-line" class="status-line" role="status">Awaiting call intake...</p>
+        <p id="error-line" class="error-line" hidden></p>
+
+        <article id="docket" class="docket is-empty">
+          <div class="docket-spine" aria-hidden="true"></div>
+          <div class="docket-body">
+            <div id="empty-state" class="empty-state">
+              <i class="ph ph-broadcast" aria-hidden="true"></i>
+              <p>No active incident</p>
+              <p class="hint">Record live audio, upload an audio file, or paste a transcript to begin real-time analysis.</p>
+            </div>
+
+            <div id="skeleton" class="skeleton" hidden>
+              <div class="sk-line w40"></div>
+              <div class="sk-line w80"></div>
+              <div class="sk-line w70"></div>
+              <div class="sk-line w55"></div>
+            </div>
+
+            <div id="incident" hidden>
+              <header class="docket-head">
+                <div>
+                  <p class="mono" id="incident-id">NGP-112</p>
+                  <p class="incident-scenario" id="incident-scenario"></p>
+                </div>
+                <p id="priority-badge" class="priority-badge">PRIORITY</p>
+              </header>
+
+              <p class="summary" id="summary"></p>
+
+              <!-- Facts Grid -->
+              <dl class="facts">
+                <div>
+                  <dt><i class="ph ph-map-pin"></i> Location</dt>
+                  <dd id="location"></dd>
+                </div>
+                <div>
+                  <dt><i class="ph ph-warning-octagon"></i> Incident Type</dt>
+                  <dd id="incident-type"></dd>
+                </div>
+                <div>
+                  <dt><i class="ph ph-users"></i> People Involved</dt>
+                  <dd id="people-involved"></dd>
+                </div>
+                <div>
+                  <dt><i class="ph ph-knife"></i> Weapon Detected</dt>
+                  <dd id="weapon"></dd>
+                </div>
+                <div>
+                  <dt><i class="ph ph-shield-warning"></i> Immediate Danger</dt>
+                  <dd id="danger"></dd>
+                </div>
+                <div>
+                  <dt><i class="ph ph-heartbeat"></i> Caller Emotional State</dt>
+                  <dd id="caller-state"></dd>
+                </div>
+              </dl>
+
+              <!-- Dual Audio Players: Original Caller Audio & Marathi Voice Broadcast -->
+              <div class="audio-players-grid" id="audio-players-grid">
+                <!-- 1. Original Caller Audio -->
+                <div class="audio-player-card original-audio-card" id="original-audio-card" hidden>
+                  <div class="audio-player-header">
+                    <div class="audio-player-title">
+                      <i class="ph ph-waveform" aria-hidden="true"></i>
+                      <span>Original Caller Recording</span>
+                    </div>
+                    <span class="audio-tag" id="original-audio-tag">Caller Audio</span>
+                  </div>
+                  <div class="audio-player-controls">
+                    <audio id="original-audio-player" controls preload="auto" class="native-audio-player"></audio>
+                  </div>
+                  <p class="hint audio-hint">Actual incoming call / microphone audio recording for review &amp; verification.</p>
+                </div>
+
+                <!-- 2. Sarvam Marathi Voice Broadcast -->
+                <div class="audio-player-card marathi-audio-card" id="sarvam-audio-card" hidden>
+                  <div class="audio-player-header">
+                    <div class="audio-player-title">
+                      <i class="ph ph-speaker-high" aria-hidden="true"></i>
+                      <span>Marathi Voice Broadcast (Sarvam Bulbul v3)</span>
+                    </div>
+                    <div class="audio-header-actions">
+                      <span class="audio-tag" id="audio-lang-tag">Marathi (mr-IN) · Voice</span>
+                      <button type="button" id="resynthesize-audio-btn" class="btn btn-secondary btn-xs" title="Re-synthesize spoken Marathi audio">
+                        <i class="ph ph-arrows-clockwise" aria-hidden="true"></i> Re-generate
+                      </button>
+                    </div>
+                  </div>
+                  <div class="audio-player-controls">
+                    <audio id="sarvam-audio-player" controls preload="auto" class="native-audio-player"></audio>
+                  </div>
+                  <p class="hint audio-hint">Instant Marathi synthesized audio broadcast for police unit radio dispatch.</p>
+                </div>
+              </div>
+
+              <!-- Split Original, Marathi & English Transcripts (Dynamically Deduplicated) -->
+              <div class="split-copy" id="transcripts-container">
+                <section id="col-original">
+                  <div class="section-title-row">
+                    <h3 id="label-original">Original Caller Speech</h3>
+                    <span class="meta mono" id="language-meta"></span>
+                  </div>
+                  <p id="transcript-original" class="transcript"></p>
+                </section>
+                <section id="col-marathi">
+                  <div class="section-title-row">
+                    <h3>Marathi (मराठी) Translation</h3>
+                    <span class="meta mono">Sarvam Mayura</span>
+                  </div>
+                  <p id="transcript-marathi" class="transcript"></p>
+                </section>
+                <section id="col-english">
+                  <div class="section-title-row">
+                    <h3>English Translation</h3>
+                    <span class="meta mono">Sarvam Mayura</span>
+                  </div>
+                  <p id="transcript-english" class="transcript"></p>
+                </section>
+              </div>
+
+              <!-- Recommendation and Action Block -->
+              <div class="priority-block">
+                <h3>Tactical Dispatch Recommendation</h3>
+                <p><span class="label">Response Plan</span> <span id="response-rec" class="highlight-text"></span></p>
+                <p><span class="label">Confidence</span> <span id="confidence" class="mono"></span></p>
+                <p><span class="label">Decision Logic</span> <span id="reasoning"></span></p>
+                <div class="meta-row">
+                  <span class="meta" id="llm-meta"></span>
+                  <span class="meta mono" id="latency-meta"></span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <aside class="panel dispatch" aria-labelledby="dispatch-heading">
+        <h2 id="dispatch-heading">Unit Dispatch</h2>
+        <button type="button" id="dispatch-btn" class="btn btn-dispatch" disabled>
+          <i class="ph ph-siren" aria-hidden="true"></i>
+          Authorize &amp; Dispatch
+        </button>
+        <p id="dispatch-note" class="hint">Confirm unit mobilization after docket review.</p>
+
+        <h3>Tasked Units (Live)</h3>
+        <ol id="dispatch-log" class="dispatch-log">
+          <li class="log-empty">No units tasked yet</li>
+        </ol>
+      </aside>
+    </div>
+  </main>
+
+  <!-- TAB 2: PREVIOUS INCIDENT RECORDS (MEMORY) -->
+  <main id="records-tab" class="tab-view" hidden>
+    <div class="records-container">
+      <div class="records-header">
+        <div>
+          <h2>Incident Memory Repository</h2>
+          <p class="hint">Persistent historical log of all processed calls, translated audio, AI extractions, and tactical dispatches.</p>
+        </div>
+        <div class="records-actions">
+          <button type="button" id="export-records-btn" class="btn btn-secondary">
+            <i class="ph ph-download-simple" aria-hidden="true"></i> Export JSON
+          </button>
+          <button type="button" id="clear-records-btn" class="btn btn-danger-outline">
+            <i class="ph ph-trash" aria-hidden="true"></i> Clear Memory
+          </button>
+        </div>
+      </div>
+
+      <!-- Filters and Search Bar -->
+      <div class="filter-bar">
+        <div class="search-box">
+          <i class="ph ph-magnifying-glass" aria-hidden="true"></i>
+          <input type="search" id="record-search" placeholder="Search by location, keyword, scenario, or ID...">
+        </div>
+
+        <div class="filter-group">
+          <span class="filter-label">Priority:</span>
+          <div class="filter-pills" id="priority-filters">
+            <button type="button" class="pill-btn active" data-priority="ALL">All</button>
+            <button type="button" class="pill-btn" data-priority="HIGH">High</button>
+            <button type="button" class="pill-btn" data-priority="MEDIUM">Medium</button>
+            <button type="button" class="pill-btn" data-priority="LOW">Low</button>
+          </div>
+        </div>
+
+        <div class="filter-group">
+          <span class="filter-label">Language:</span>
+          <select id="language-filter" class="select-input">
+            <option value="ALL">All Languages</option>
+            <option value="Marathi">Marathi</option>
+            <option value="Hindi">Hindi</option>
+            <option value="English">English</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Records Table & Cards -->
+      <div class="records-content">
+        <div id="records-loading" class="records-loading" hidden>
+          <i class="ph ph-spinner-gap ph-spin" aria-hidden="true"></i>
+          <p>Loading memory records...</p>
+        </div>
+        <div id="records-empty" class="empty-state" hidden>
+          <i class="ph ph-folder-open" aria-hidden="true"></i>
+          <p>No records found</p>
+          <p class="hint">Process calls in the Live Dispatch tab to populate memory.</p>
+        </div>
+        <div id="records-grid" class="records-grid"></div>
+      </div>
+    </div>
+  </main>
+
+  <!-- TAB 3: INTELLIGENCE & ANALYTICS -->
+  <main id="analytics-tab" class="tab-view" hidden>
+    <div class="analytics-container">
+      <div class="analytics-header">
+        <div>
+          <h2>Incident Intelligence &amp; Performance Analytics</h2>
+          <p class="hint">Live computational breakdown of emergency calls, regional patterns, language distribution, and pipeline speeds.</p>
+        </div>
+        <button type="button" id="refresh-analytics-btn" class="btn btn-secondary">
+          <i class="ph ph-arrows-clockwise" aria-hidden="true"></i> Refresh Analytics
+        </button>
+      </div>
+
+      <!-- KPI Summary Cards -->
+      <div class="kpi-grid">
+        <div class="kpi-card">
+          <div class="kpi-icon kpi-blue"><i class="ph ph-files"></i></div>
+          <div class="kpi-info">
+            <span class="kpi-label">Total Incidents</span>
+            <span class="kpi-value" id="kpi-total">0</span>
+          </div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-icon kpi-red"><i class="ph ph-warning-octagon"></i></div>
+          <div class="kpi-info">
+            <span class="kpi-label">High Priority Calls</span>
+            <span class="kpi-value" id="kpi-high-prio">0</span>
+          </div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-icon kpi-green"><i class="ph ph-siren"></i></div>
+          <div class="kpi-info">
+            <span class="kpi-label">Units Dispatched</span>
+            <span class="kpi-value" id="kpi-dispatched">0</span>
+          </div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-icon kpi-orange"><i class="ph ph-knife"></i></div>
+          <div class="kpi-info">
+            <span class="kpi-label">Weapon Alerts</span>
+            <span class="kpi-value" id="kpi-weapons">0</span>
+          </div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-icon kpi-purple"><i class="ph ph-lightning"></i></div>
+          <div class="kpi-info">
+            <span class="kpi-label">Avg Pipeline Speed</span>
+            <span class="kpi-value mono" id="kpi-latency">0 ms</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Charts & Breakdown Grids -->
+      <div class="analytics-grid">
+        <!-- Priority Breakdown -->
+        <section class="analytics-card">
+          <div class="card-head">
+            <h3><i class="ph ph-chart-donut"></i> Threat Level Distribution</h3>
+          </div>
+          <div class="chart-box" id="priority-chart-box">
+            <div class="stat-bars" id="priority-bars"></div>
+          </div>
+        </section>
+
+        <!-- Incident Types -->
+        <section class="analytics-card">
+          <div class="card-head">
+            <h3><i class="ph ph-tag"></i> Incident Categories</h3>
+          </div>
+          <div class="chart-box" id="incidents-chart-box">
+            <div class="stat-bars" id="incident-bars"></div>
+          </div>
+        </section>
+
+        <!-- Language Distribution -->
+        <section class="analytics-card">
+          <div class="card-head">
+            <h3><i class="ph ph-translate"></i> Native Language Intake</h3>
+          </div>
+          <div class="chart-box" id="languages-chart-box">
+            <div class="stat-bars" id="language-bars"></div>
+          </div>
+        </section>
+
+        <!-- Regional Location Hotspots -->
+        <section class="analytics-card">
+          <div class="card-head">
+            <h3><i class="ph ph-map-trifold"></i> High-Activity Locations</h3>
+          </div>
+          <div class="chart-box" id="locations-chart-box">
+            <div class="stat-bars" id="location-bars"></div>
+          </div>
+        </section>
+
+        <!-- Pipeline Latency Breakdown -->
+        <section class="analytics-card span-2">
+          <div class="card-head">
+            <h3><i class="ph ph-timer"></i> AI Processing Latency Breakdown (Average)</h3>
+            <span class="hint">Sarvam STT + Mayura Translation + Gemini LLM Extraction + Bulbul TTS</span>
+          </div>
+          <div class="latency-grid" id="latency-stats-grid">
+            <div class="latency-pill">
+              <span class="label">Language ID &amp; STT</span>
+              <span class="mono val" id="lat-speech">0 ms</span>
+            </div>
+            <div class="latency-pill">
+              <span class="label">Sarvam Translation</span>
+              <span class="mono val" id="lat-translate">0 ms</span>
+            </div>
+            <div class="latency-pill">
+              <span class="label">LLM Feature Extraction</span>
+              <span class="mono val" id="lat-extract">0 ms</span>
+            </div>
+            <div class="latency-pill">
+              <span class="label">Sarvam Bulbul TTS Voice</span>
+              <span class="mono val" id="lat-tts">0 ms</span>
+            </div>
+            <div class="latency-pill total">
+              <span class="label">Total End-to-End Speed</span>
+              <span class="mono val" id="lat-total">0 ms</span>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <!-- RECORD DETAIL MODAL -->
+  <dialog id="record-modal" class="record-modal" aria-labelledby="modal-title">
+    <div class="modal-content">
+      <header class="modal-header">
+        <div>
+          <h3 id="modal-title" class="mono">INCIDENT DETAIL</h3>
+          <p id="modal-subtitle" class="hint"></p>
+        </div>
+        <button type="button" id="modal-close-btn" class="modal-close" aria-label="Close dialog">
+          <i class="ph ph-x"></i>
+        </button>
+      </header>
+
+      <div class="modal-body" id="modal-body"></div>
+    </div>
+  </dialog>
+
+  <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
