@@ -1,0 +1,24 @@
+rakshak_env/
+.venv/
+venv/
+.env
+__pycache__/
+*.py[cod]
+*.pyc
+*.log
+.DS_Store
+uploads/
+*.webm
+*.wav
+*.mp3
+
+# Data store (contains large base64 audio blobs)
+data/records.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
