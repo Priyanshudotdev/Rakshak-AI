@@ -177,9 +177,16 @@ export class AriController {
   private async onCall(event: { [k: string]: any }): Promise<void> {
     const channel = event.channel ?? {};
     const channelId = String(channel.id ?? "");
+    const channelName = String(channel.name ?? "");
     const exten = String(event.args?.[0] ?? "");
     const caller = String(channel.caller?.number ?? "");
     if (!channelId) return;
+    // Our own External Media forks enter the same ARI app — they are media
+    // pipes, not callers. Bridging them again cascades: each fork births
+    // another fork until RTP ports exhaust and Asterisk falls over.
+    if (channelName.startsWith("UnicastRTP/")) return;
+    // Duplicate StasisStart for a leg we already own: ignore, never double-fork.
+    if (this.legs.has(channelId)) return;
     const callId = `ARI-${channelId.slice(0, 8).toUpperCase()}`;
     this.hooks.publish("call.answered", callId, { via: "ari", exten, caller });
 

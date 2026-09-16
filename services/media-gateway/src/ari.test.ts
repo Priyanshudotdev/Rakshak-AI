@@ -136,6 +136,20 @@ describe("AriController", () => {
     expect(ctx.published.at(-1)).toMatchObject({ name: "call.ended" });
   });
 
+  it("ignores its own media forks and duplicate starts (no fork cascade)", async () => {
+    const ctx = setup();
+    await ctx.controller.start();
+    const emit = (id: string, name: string, args: string[]) =>
+      ctx.socket().emit("message", JSON.stringify({ type: "StasisStart", channel: { id, name }, args }));
+    emit("chan-dup-01", "PJSIP/1001-00000001", ["9000"]);
+    emit("chan-dup-01", "PJSIP/1001-00000001", ["9000"]);
+    emit("ext-1", "UnicastRTP/media-gateway-00000001", []);
+    await new Promise((r) => setTimeout(r, 50));
+    // Exactly one external fork despite three StasisStart events.
+    expect(ctx.calls.filter((c) => c.url.includes("externalMedia"))).toHaveLength(1);
+    expect(ctx.calls.filter((c) => c.url.includes("bridges") && c.method === "POST")).toHaveLength(1);
+  });
+
   it("survives malformed frames and failed REST calls", async () => {
     const ctx = setup();
     await ctx.controller.start();
