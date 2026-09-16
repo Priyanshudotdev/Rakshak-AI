@@ -18,6 +18,12 @@ data/records.json.corrupt
 data/dispatch_log.json
 data/incident_sources.json
 data/audit_log.json
+data/operators.json
+data/operator_sessions.json
+
+# Deploy-time telephony secrets (templates are *.example, live files ignored)
+infrastructure/asterisk/pjsip.d/20-trunk.conf
+infrastructure/asterisk/ari.d/10-password.conf
 
 # IDE
 .vscode/

@@ -9,9 +9,11 @@ decides incidents, priorities or dispatches.
 
 | File | Purpose |
 |---|---|
-| `pjsip.conf` | Transports, provider trunk (credential placeholders only), test extension `1000` |
-| `extensions.conf` | `rakshak-incoming` context → `Stasis(rakshak,…)`, then hangup. Switching only. |
+| `pjsip.conf` | Transports + local softphone extensions `1000/1001/1002` (no provider needed) |
+| `pjsip.d/20-trunk.conf.example` | Provider trunk template → copy to `20-trunk.conf` (git-ignored) at deploy |
+| `extensions.conf` | `1001↔1002` intercom (direct Dial) + `9000/1000` → `rakshak-emergency` → `Stasis(rakshak,…)`. Switching only. |
 | `ari.conf` | ARI user `rakshak-gateway` for the media gateway (password injected at deploy) |
+| `http.conf` / `rtp.conf` | ARI HTTP on 8088; RTP range 10000–10100 (matches compose ports) |
 
 ## Bring-up (single host, Docker)
 
@@ -21,8 +23,24 @@ decides incidents, priorities or dispatches.
 2. Mount this directory read-only into the Asterisk container and
    `envsubst` the `${VAR:-default}` placeholders at container start.
 3. Point `RAKSHAK_MEDIA_WS` at the gateway (`ws://media-gateway:3002/gateway/audio`).
-4. Register a softphone as `1000` and dial `1000` to exercise the
-   SIP leg → ARI → gateway → incident-card loop.
+4. Register two real phones (Linphone, same WiFi) as `1001` / `1002` and
+   dial each other, or dial `9000` for the emergency test line
+   (needs the gateway ARI client — Phase 4).
+
+## Two real phones, same WiFi (free, no provider)
+
+On the Asterisk host PC, find its WiFi IP (here: `10.238.252.229`).
+
+| Linphone field | Phone 1 | Phone 2 |
+|---|---|---|
+| Username | `1001` | `1002` |
+| Password | `rakshak-phone-1` | `rakshak-phone-2` |
+| Domain | `10.238.252.229` | `10.238.252.229` |
+| Port / Transport | `5060` / UDP | `5060` / UDP |
+
+Then: phone 1 dials `1002` (intercom), either phone dials `9000`
+(emergency line → ARI app `rakshak`). Verify on the box:
+`docker exec <asterisk> asterisk -rx "pjsip show endpoints"`.
 
 ## Security notes (spec §25)
 

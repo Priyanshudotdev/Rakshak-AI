@@ -90,6 +90,26 @@ services:
       api:
         condition: service_started
 
+  asterisk:
+    # Telephony foundation (spec §6): PJSIP softphone extensions + dialplan.
+    # andrius/asterisk runs Asterisk 20 foreground; our configs mount read-only.
+    # Trunk (pjsip.d/20-trunk.conf) is intentionally NOT mounted — no provider
+    # yet, and Asterisk cannot expand ${VAR} placeholders itself.
+    image: andrius/asterisk:latest
+    ports:
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "10000-10100:10000-10100/udp"
+      - "8088:8088"
+    volumes:
+      - ./infrastructure/asterisk/pjsip.conf:/etc/asterisk/pjsip.conf:ro
+      - ./infrastructure/asterisk/extensions.conf:/etc/asterisk/extensions.conf:ro
+      - ./infrastructure/asterisk/ari.conf:/etc/asterisk/ari.conf:ro
+      - ./infrastructure/asterisk/http.conf:/etc/asterisk/http.conf:ro
+      - ./infrastructure/asterisk/rtp.conf:/etc/asterisk/rtp.conf:ro
+    depends_on:
+      - media-gateway
+
   nginx:
     image: nginx:1.27-alpine
     volumes:

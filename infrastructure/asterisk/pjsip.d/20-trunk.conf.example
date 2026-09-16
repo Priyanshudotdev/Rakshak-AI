@@ -1,0 +1,32 @@
+; 20-trunk.conf.example — copy to 20-trunk.conf (git-ignored) and fill real
+; provider credentials at deploy time. Mounted alongside pjsip.conf.
+; Requires envsubst or manual edit: Asterisk does NOT expand ${VAR} itself.
+
+[trunk-reg]
+type = registration
+transport = transport-udp
+outbound_auth = trunk-auth
+server_uri = sip:SIP_TRUNK_HOST
+client_uri = sip:SIP_TRUNK_USER@SIP_TRUNK_HOST
+retry_interval = 20
+max_retries = 20
+
+[trunk-auth]
+type = auth
+auth_type = userpass
+username = SIP_TRUNK_USER
+password = SIP_TRUNK_PASSWORD
+
+[trunk-aor]
+type = aor
+contact = sip:SIP_TRUNK_HOST:5060
+qualify_frequency = 60
+
+[trunk](trunk-endpoint)
+outbound_auth = trunk-auth
+aors = trunk-aor
+
+[trunk-identify]
+type = identify
+endpoint = trunk
+match = SIP_TRUNK_HOST
