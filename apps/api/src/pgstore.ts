@@ -10,7 +10,12 @@ import type { Doc } from "./store.js";
 
 let schemaReady = false;
 
-const MIGRATIONS = ["002_records_store.sql", "003_verification_sources.sql", "004_audit_log.sql"];
+const MIGRATIONS = [
+  "002_records_store.sql",
+  "003_verification_sources.sql",
+  "004_audit_log.sql",
+  "005_operator_auth.sql",
+];
 
 function pool() {
   const p = selectedPool();
@@ -278,6 +283,67 @@ export async function getAuditLog(limit = 50): Promise<Doc[]> {
     entity_id: r.entity_id,
     detail: typeof r.detail === "string" ? JSON.parse(r.detail) : (r.detail ?? {}),
   }));
+}
+
+export interface OperatorInput {
+  name: string;
+  role?: string;
+  passwordHash?: string | null;
+}
+
+/** Operator accounts (§25). First registered operator becomes admin. */
+export async function countOperators(): Promise<number> {
+  await ensureSchema();
+  const res = await pool().query("SELECT COUNT(*) AS n FROM operators");
+  return Number(res.rows[0]?.n ?? 0);
+}
+
+export async function findOperatorByName(name: string): Promise<Doc | null> {
+  await ensureSchema();
+  const res = await pool().query("SELECT id, name, role, password_hash, active, created_at FROM operators WHERE lower(name) = lower($1) LIMIT 1", [name]);
+  return res.rows[0] ?? null;
+}
+
+export async function createOperator(input: OperatorInput): Promise<Doc> {
+  await ensureSchema();
+  const role = (await countOperators()) === 0 ? "admin" : String(input.role ?? "operator").slice(0, 20);
+  const res = await pool().query(
+    // id is app-supplied: fresh 005 tables use TEXT with no default, while
+    // 001-created UUID tables accept the same uuid string. Never return hash.
+    "INSERT INTO operators (id, name, role, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, name, role, active, created_at",
+    [randomUUID(), String(input.name).slice(0, 100), role, input.passwordHash ?? null],
+  );
+  return res.rows[0];
+}
+
+export async function createSession(operatorId: string, token: string, expiresAt: string): Promise<void> {
+  await ensureSchema();
+  await pool().query("INSERT INTO operator_sessions (token, operator_id, expires_at) VALUES ($1, $2, $3)", [
+    token,
+    operatorId,
+    expiresAt,
+  ]);
+}
+
+export async function resolveSession(token: string): Promise<Doc | null> {
+  await ensureSchema();
+  const res = await pool().query(
+    // o.id::text — operators.id is UUID where 001 was applied, TEXT otherwise.
+    `SELECT o.id, o.name, o.role, o.active
+     FROM operator_sessions s JOIN operators o ON o.id::text = s.operator_id
+     WHERE s.token = $1 AND s.expires_at > now() AND o.active = true LIMIT 1`,
+    [token],
+  );
+  if (!res.rows.length) {
+    await pool().query("DELETE FROM operator_sessions WHERE token = $1 OR expires_at <= now()", [token]);
+    return null;
+  }
+  return res.rows[0];
+}
+
+export async function revokeSession(token: string): Promise<void> {
+  await ensureSchema();
+  await pool().query("DELETE FROM operator_sessions WHERE token = $1", [token]);
 }
 
 export async function getIncidentVerification(incidentKey: string): Promise<{ verification: string; reports: number; evidence: Doc[] }> {

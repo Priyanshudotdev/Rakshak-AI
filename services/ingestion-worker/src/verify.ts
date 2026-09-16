@@ -8,6 +8,7 @@ export type Verification = "unverified" | "multiple_reports" | "corroborated" | 
 
 const API_URL = process.env.API_URL ?? "http://localhost:3001";
 const INGEST_KEY = process.env.EVENT_INGEST_KEY ?? "";
+const OPERATOR_TOKEN = process.env.OPERATOR_TOKEN ?? "";
 
 const counts = new Map<string, number>();
 
@@ -47,6 +48,7 @@ export async function recordSource(
       headers: {
         "Content-Type": "application/json",
         ...(INGEST_KEY ? { "x-ingest-key": INGEST_KEY } : {}),
+        ...(OPERATOR_TOKEN ? { Authorization: `Bearer ${OPERATOR_TOKEN}` } : {}),
       },
       body: JSON.stringify({
         report_id: report.id,

@@ -189,10 +189,11 @@ app.get("/api/records/:id", async (req, reply) => {
 });
 
 app.delete("/api/records/:id", async (req, reply) => {
+  if (!(await requireAuth(req, reply))) return;
   const { id } = req.params as { id: string };
   const ok = await store.deleteRecord(id);
   if (!ok) return reply.code(404).send({ status: "error", message: "Record not found" });
-  await store.appendAudit({ actor: actorOf(req), action: "record.delete", entity: "record", entity_id: id });
+  await store.appendAudit({ actor: await actorOf(req), action: "record.delete", entity: "record", entity_id: id });
   return { status: "success", message: "Record deleted" };
 });
 
@@ -240,12 +241,13 @@ const sourceSchema = z.object({
 // Durable corroboration ledger (§19): idempotent per report; the worker posts
 // here instead of counting in memory, so verification survives restarts.
 app.post("/api/incidents/:key/sources", async (req, reply) => {
+  if (!(await requireAuth(req, reply))) return;
   const { key } = req.params as { key: string };
   const parsed = sourceSchema.safeParse(req.body);
   if (!parsed.success) return reply.code(400).send({ status: "error", message: "report_id is required" });
   try {
     const data = await store.addIncidentSource(key, parsed.data);
-    await store.appendAudit({ actor: actorOf(req), action: "source.attach", entity: "incident", entity_id: key, detail: parsed.data });
+    await store.appendAudit({ actor: await actorOf(req), action: "source.attach", entity: "incident", entity_id: key, detail: parsed.data });
     return { status: "success", data };
   } catch (err) {
     log("error", "add-source failed", { err: String(err) });
@@ -266,22 +268,36 @@ app.get("/api/incidents/:key/verification", async (req, reply) => {
 
 app.get("/api/dispatch", async () => store.getDispatchLog());
 
-function actorOf(req: { headers: Record<string, string | string[] | undefined> }): string {
-  const h = req.headers["x-operator"];
-  const actor = Array.isArray(h) ? h[0] : h;
-  return (actor ?? "operator").toString().slice(0, 100) || "operator";
+async function actorOf(req: { headers: Record<string, string | string[] | undefined> }): Promise<string> {
+  const { authenticate, actorFrom } = await import("./auth.js");
+  return actorFrom(req.headers, await authenticate(store, req.headers));
+}
+
+/** Hard gate for mutating routes. Returns true to proceed; sends 401 and
+ *  returns false when AUTH_REQUIRED=1 without a valid Bearer session. */
+async function requireAuth(
+  req: { headers: Record<string, string | string[] | undefined> },
+  reply: { code(n: number): { send(b: unknown): unknown } },
+): Promise<boolean> {
+  const { authenticate, authRequired } = await import("./auth.js");
+  if (!authRequired()) return true;
+  const op = await authenticate(store, req.headers);
+  if (op) return true;
+  reply.code(401).send({ status: "error", message: "Operator sign-in required" });
+  return false;
 }
 
 // One-shot backfill (§15): project stored records into the normalized +
 // PostGIS schema. Postgres-only; safe to re-run (per-call rows replaced).
 app.post("/api/admin/sync-normalized", async (req, reply) => {
+  if (!(await requireAuth(req, reply))) return;
   const { selectedPool } = await import("./db.js");
   const { syncAll } = await import("./sync.js");
   const pool = selectedPool();
   if (!pool) return reply.code(400).send({ status: "error", message: "Postgres backend required for normalized sync" });
   try {
     const result = await syncAll(pool, store);
-    await store.appendAudit({ actor: actorOf(req), action: "admin.sync-normalized", entity: "database", detail: result });
+    await store.appendAudit({ actor: await actorOf(req), action: "admin.sync-normalized", entity: "database", detail: result });
     return { status: "success", data: result };
   } catch (err) {
     log("error", "sync-normalized failed", { err: String(err) });
@@ -290,15 +306,76 @@ app.post("/api/admin/sync-normalized", async (req, reply) => {
   }
 });
 
+const credentialsSchema = z.object({
+  name: z.string().min(1).max(100),
+  password: z.string().min(4).max(200),
+});
+
+// First registered operator becomes admin; afterwards only admins may register.
+app.post("/api/operators/register", async (req, reply) => {
+  const parsed = credentialsSchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ status: "error", message: "name and password (min 4 chars) are required" });
+  const { hashPassword } = await import("./auth.js");
+  try {
+    if ((await store.countOperators()) > 0) {
+      const { authenticate } = await import("./auth.js");
+      const me = await authenticate(store, req.headers);
+      if (!me) return reply.code(401).send({ status: "error", message: "Admin sign-in required" });
+      if ((me as { role?: string }).role !== "admin") {
+        return reply.code(403).send({ status: "error", message: "Admin role required" });
+      }
+    }
+    if (await store.findOperatorByName(parsed.data.name)) {
+      return reply.code(409).send({ status: "error", message: "Operator name is taken" });
+    }
+    const op = await store.createOperator({ name: parsed.data.name.trim(), passwordHash: await hashPassword(parsed.data.password) });
+    await store.appendAudit({ actor: op.name, action: "operator.register", entity: "operator", entity_id: String(op.id) });
+    return { status: "success", data: op };
+  } catch (err) {
+    const e = serverError(err);
+    return reply.code(e.code).send(e.body);
+  }
+});
+
+app.post("/api/operators/login", async (req, reply) => {
+  const parsed = credentialsSchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ status: "error", message: "name and password are required" });
+  const { verifyPassword, newToken, tokenExpiry } = await import("./auth.js");
+  const op = await store.findOperatorByName(parsed.data.name);
+  if (!op || op.active === false) return reply.code(401).send({ status: "error", message: "Invalid credentials" });
+  if (!op.password_hash || !(await verifyPassword(parsed.data.password, String(op.password_hash)))) {
+    return reply.code(401).send({ status: "error", message: "Invalid credentials" });
+  }
+  const token = newToken();
+  await store.createSession(String(op.id), token, tokenExpiry());
+  await store.appendAudit({ actor: op.name, action: "operator.login", entity: "operator", entity_id: String(op.id) });
+  return { status: "success", data: { token, operator: { id: op.id, name: op.name, role: op.role } } };
+});
+
+app.get("/api/operators/me", async (req, reply) => {
+  const { authenticate } = await import("./auth.js");
+  const op = await authenticate(store, req.headers);
+  if (!op) return reply.code(401).send({ status: "error", message: "Operator sign-in required" });
+  return { status: "success", data: { id: op.id, name: op.name, role: op.role } };
+});
+
+app.post("/api/operators/logout", async (req) => {
+  const raw = (req.headers.authorization ?? "").toString();
+  const token = raw.startsWith("Bearer ") ? raw.slice(7).trim() : "";
+  if (token) await store.revokeSession(token);
+  return { status: "success", message: "Signed out" };
+});
+
 app.get("/api/audit", async (req) => {
   const q = req.query as { limit?: string };
   const limit = Math.max(1, Math.min(Number(q.limit ?? 50) || 50, 500));
   return { status: "success", data: await store.getAuditLog(limit) };
 });
 
-app.post("/api/dispatch", async (req) => {
+app.post("/api/dispatch", async (req, reply) => {
+  if (!(await requireAuth(req, reply))) return;
   const body = (req.body ?? {}) as Record<string, any>;
-  const actor = actorOf(req);
+  const actor = await actorOf(req);
   const entry = {
     time: new Date().toLocaleTimeString("en-GB", { hour12: false }),
     call_id: body.call_id ?? "LIVE",
@@ -322,3 +399,4 @@ try {
   log("error", "api failed to start", { err: String(err) });
   process.exit(1);
 }
+

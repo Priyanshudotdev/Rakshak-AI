@@ -290,6 +290,79 @@ export async function getAuditLog(limit = 50): Promise<Doc[]> {
   return (await loadAudit()).slice(0, Math.max(1, Math.min(limit, AUDIT_CAP)));
 }
 
+const OPERATORS_FILE = path.join(DATA_DIR, "operators.json");
+const SESSIONS_FILE = path.join(DATA_DIR, "operator_sessions.json");
+
+async function loadJson(file: string): Promise<Doc[]> {
+  try {
+    const content = await fs.readFile(file, "utf-8");
+    const data: unknown = JSON.parse(content);
+    return Array.isArray(data) ? (data as Doc[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveJson(file: string, rows: Doc[]): Promise<void> {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  const tmp = `${file}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(rows, null, 2), "utf-8");
+  await fs.rename(tmp, file);
+}
+
+export interface OperatorInput {
+  name: string;
+  role?: string;
+  passwordHash?: string | null;
+}
+
+/** File mirror of the operators/sessions tables: same first-is-admin rule. */
+export async function countOperators(): Promise<number> {
+  return (await loadJson(OPERATORS_FILE)).length;
+}
+
+export async function findOperatorByName(name: string): Promise<Doc | null> {
+  const rows = await loadJson(OPERATORS_FILE);
+  return rows.find((r) => String(r.name ?? "").toLowerCase() === String(name).toLowerCase()) ?? null;
+}
+
+export async function createOperator(input: OperatorInput): Promise<Doc> {
+  const rows = await loadJson(OPERATORS_FILE);
+  const entry: Doc = {
+    id: randomUUID(),
+    name: String(input.name).slice(0, 100),
+    role: rows.length === 0 ? "admin" : String(input.role ?? "operator").slice(0, 20),
+    password_hash: input.passwordHash ?? null,
+    active: true,
+    created_at: new Date().toISOString(),
+  };
+  rows.push(entry);
+  await saveJson(OPERATORS_FILE, rows);
+  const { password_hash: _ph, ...safe } = entry;
+  return safe;
+}
+
+export async function createSession(operatorId: string, token: string, expiresAt: string): Promise<void> {
+  const rows = await loadJson(SESSIONS_FILE);
+  rows.push({ token, operator_id: operatorId, created_at: new Date().toISOString(), expires_at: expiresAt });
+  await saveJson(SESSIONS_FILE, rows);
+}
+
+export async function resolveSession(token: string): Promise<Doc | null> {
+  const now = new Date().toISOString();
+  const rows = await loadJson(SESSIONS_FILE);
+  const live = rows.filter((r) => String(r.expires_at ?? "") > now);
+  if (live.length !== rows.length) await saveJson(SESSIONS_FILE, live);
+  const hit = live.find((r) => r.token === token);
+  if (!hit) return null;
+  const op = (await loadJson(OPERATORS_FILE)).find((r) => r.id === hit.operator_id && r.active !== false);
+  return op ? { id: op.id, name: op.name, role: op.role, active: true } : null;
+}
+
+export async function revokeSession(token: string): Promise<void> {
+  await saveJson(SESSIONS_FILE, (await loadJson(SESSIONS_FILE)).filter((r) => r.token !== token));
+}
+
 /** Next dispatch id from the max existing suffix — count-based ids collide after the 200-cap trim. */
 export function nextDispatchId(log: Doc[]): string {
   let max = 0;

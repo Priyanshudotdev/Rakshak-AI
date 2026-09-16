@@ -13,7 +13,12 @@ const pgstore = await import("./pgstore.js");
 const { computeAnalytics } = await import("./analytics.js");
 
 // All live migrations, exactly as production applies them in order.
-const MIGRATION = ["002_records_store.sql", "003_verification_sources.sql", "004_audit_log.sql"]
+const MIGRATION = [
+  "002_records_store.sql",
+  "003_verification_sources.sql",
+  "004_audit_log.sql",
+  "005_operator_auth.sql",
+]
   .map((f) => readFileSync(fileURLToPath(new URL(`../../../database/migrations/${f}`, import.meta.url)), "utf-8"))
   .join("\n");
 
@@ -21,11 +26,27 @@ let pool: PoolLike;
 
 beforeEach(async () => {
   const db = newDb();
-  await db.public.query(MIGRATION);
+  // One statement at a time: pg-mem silently drops trailing statements of a
+  // large multi-migration batch (005 tables went missing).
+  for (const stmt of MIGRATION.replace(/--[^\n]*/g, "").split(";")) {
+    const trimmed = stmt.replace(/IF NOT EXISTS/gi, " ").trim();
+    if (!trimmed) continue;
+    try {
+      await db.public.query(trimmed);
+    } catch (err) {
+      if (!/already exists/i.test(String(err))) throw err;
+    }
+  }
   const { Pool } = db.adapters.createPg();
   pool = new Pool() as unknown as PoolLike;
   injectPool(pool);
   await file.clearAll();
+  // Operator/auth files are global to the sandbox: reset for determinism.
+  const { rm } = await import("node:fs/promises");
+  const dir = process.env.DATA_DIR as string;
+  for (const f of ["operators.json", "operator_sessions.json", "incident_sources.json", "audit_log.json"]) {
+    await rm(join(dir, f), { force: true });
+  }
 });
 
 function seedInput(overrides: Record<string, unknown> = {}) {
@@ -162,6 +183,25 @@ describe("pgstore (Postgres backend)", () => {
     expect((await file.getRecord("GEO-F"))?.extraction?.geo).toEqual(geo);
     expect((await pgstore.getRecord("GEO-P"))?.extraction?.geo).toEqual(geo);
     expect(await pgstore.updateRecordGeo("GHOST", geo)).toBe(false);
+  });
+
+  it("registers operators first-is-admin with session lifecycle in both backends", async () => {
+    for (const s of [file, pgstore]) {
+      const admin = await s.createOperator({ name: "Ops Admin", passwordHash: "h1" });
+      expect(admin.role).toBe("admin");
+      expect(admin).not.toHaveProperty("password_hash");
+      const op = await s.createOperator({ name: "Ops Other", passwordHash: "h2" });
+      expect(op.role).toBe("operator");
+      expect((await s.findOperatorByName("ops admin"))?.id).toBe(admin.id);
+      expect(await s.findOperatorByName("ghost")).toBeNull();
+      const future = new Date(Date.now() + 3600_000).toISOString();
+      await s.createSession(admin.id, "tok-live", future);
+      expect((await s.resolveSession("tok-live"))?.name).toBe("Ops Admin");
+      await s.revokeSession("tok-live");
+      expect(await s.resolveSession("tok-live")).toBeNull();
+      await s.createSession(admin.id, "tok-dead", new Date(Date.now() - 1000).toISOString());
+      expect(await s.resolveSession("tok-dead")).toBeNull();
+    }
   });
 
   it("stamps the returned entry with its dispatch id (file-store parity)", async () => {

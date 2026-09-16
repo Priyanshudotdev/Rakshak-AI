@@ -78,6 +78,73 @@ export async function getDispatchLog(): Promise<import("./types").DispatchEntry[
 }
 
 const OPERATOR_KEY = "rakshak.operator";
+const TOKEN_KEY = "rakshak.token";
+
+function authHeaders(): Record<string, string> {
+  try {
+    const token = localStorage.getItem(TOKEN_KEY);
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  } catch {
+    return {};
+  }
+}
+
+export function signedInOperator(): { name: string; role: string } | null {
+  try {
+    const raw = localStorage.getItem("rakshak.session");
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { name?: string; role?: string };
+    return parsed.name ? { name: parsed.name, role: parsed.role ?? "operator" } : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function login(name: string, password: string) {
+  const res = await fetch(`${API_URL}/api/operators/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, password }),
+  });
+  const body = await json<{ status: string; data: { token: string; operator: { name: string; role: string } } }>(res);
+  try {
+    localStorage.setItem(TOKEN_KEY, body.data.token);
+    localStorage.setItem("rakshak.session", JSON.stringify(body.data.operator));
+    localStorage.setItem(OPERATOR_KEY, body.data.operator.name);
+  } catch {
+    /* private mode */
+  }
+  return body.data.operator;
+}
+
+export async function register(name: string, password: string) {
+  const res = await fetch(`${API_URL}/api/operators/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, password }),
+  });
+  return json<{ status: string; data: { name: string; role: string } }>(res);
+}
+
+export async function logout() {
+  try {
+    const token = localStorage.getItem(TOKEN_KEY);
+    if (token) {
+      await fetch(`${API_URL}/api/operators/logout`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    }
+  } catch {
+    /* best-effort */
+  }
+  try {
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem("rakshak.session");
+  } catch {
+    /* ignore */
+  }
+}
 
 /** Operator callsign for the audit trail (stored locally, sent as x-operator). */
 export function operatorName(): string {
@@ -105,7 +172,7 @@ export async function postDispatch(entry: {
 }) {
   const res = await fetch(`${API_URL}/api/dispatch`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "x-operator": operatorName() },
+    headers: { "Content-Type": "application/json", "x-operator": operatorName(), ...authHeaders() },
     body: JSON.stringify(entry),
   });
   return json<{ status: string; data: import("./types").DispatchEntry; log: import("./types").DispatchEntry[] }>(res);
@@ -123,7 +190,7 @@ export async function synthesize(text: string, opts?: { language_code?: string; 
 export async function deleteRecord(id: string) {
   const res = await fetch(`${API_URL}/api/records/${encodeURIComponent(id)}`, {
     method: "DELETE",
-    headers: { "x-operator": operatorName() },
+    headers: { "x-operator": operatorName(), ...authHeaders() },
   });
   return json<{ status: string; message: string }>(res);
 }

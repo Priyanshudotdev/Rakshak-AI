@@ -10,11 +10,15 @@ import {
   getHealth,
   getRecordCount,
   listRecords,
+  login,
+  logout,
   operatorName,
   postDispatch,
   processAudioFile,
   processCall,
+  register,
   setOperatorName,
+  signedInOperator,
   synthesize,
 } from "../lib/api";
 import type { LiveEvent } from "../lib/live";
@@ -536,23 +540,81 @@ function DispatchPanel() {
   const { data, isPending } = useQuery({ queryKey: ["dispatch"], queryFn: getDispatchLog, refetchInterval: 5000 });
   const log: DispatchEntry[] = Array.isArray(data) ? data : [];
   const [callsign, setCallsign] = useState(operatorName());
+  const [session, setSession] = useState(signedInOperator());
+  const [password, setPassword] = useState("");
+  const [authError, setAuthError] = useState<string | null>(null);
   return (
     <Card>
       <CardHead title="Dispatch log" sub="Operator decisions — auditable" right={<Badge tone="info">{log.length}</Badge>} />
       <CardBody>
-        <label className="mb-2 flex items-center gap-2 text-xs text-muted">
-          Callsign
-          <input
-            value={callsign}
-            onChange={(e) => {
-              setCallsign(e.target.value);
-              setOperatorName(e.target.value);
-            }}
-            placeholder="operator"
-            maxLength={100}
-            className="w-full rounded-md2 border border-line bg-ink px-2 py-1 text-xs text-cream outline-none placeholder:text-muted"
-          />
-        </label>
+        {session ? (
+          <p className="mb-2 flex items-center justify-between gap-2 text-xs text-muted">
+            <span>
+              Signed in as <span className="text-cream">{session.name}</span> ({session.role})
+            </span>
+            <button
+              className="text-accentlight hover:underline"
+              onClick={() => {
+                void logout().then(() => {
+                  setSession(null);
+                });
+              }}
+            >
+              Sign out
+            </button>
+          </p>
+        ) : (
+          <div className="mb-2 space-y-1.5">
+            <div className="flex items-center gap-2 text-xs text-muted">
+              <span className="w-14 shrink-0">Callsign</span>
+              <input
+                value={callsign}
+                onChange={(e) => {
+                  setCallsign(e.target.value);
+                  setOperatorName(e.target.value);
+                }}
+                placeholder="operator"
+                maxLength={100}
+                className="w-full rounded-md2 border border-line bg-ink px-2 py-1 text-xs text-cream outline-none placeholder:text-muted"
+              />
+            </div>
+            <div className="flex items-center gap-2 text-xs text-muted">
+              <span className="w-14 shrink-0">Password</span>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="first sign-in registers"
+                maxLength={200}
+                className="w-full rounded-md2 border border-line bg-ink px-2 py-1 text-xs text-cream outline-none placeholder:text-muted"
+              />
+              <button
+                className="shrink-0 text-accentlight hover:underline"
+                onClick={() => {
+                  setAuthError(null);
+                  const name = callsign.trim() || "operator";
+                  const done = (op: { name: string; role: string }) => {
+                    setSession(op);
+                    setOperatorName(op.name);
+                    setPassword("");
+                  };
+                  // First operator bootstraps via register; afterwards login.
+                  login(name, password)
+                    .then(done)
+                    .catch(() =>
+                      register(name, password)
+                        .then(() => login(name, password))
+                        .then(done)
+                        .catch(() => setAuthError("Sign-in failed — check name/password.")),
+                    );
+                }}
+              >
+                Sign in
+              </button>
+            </div>
+            {authError ? <p className="text-xs text-red-400">{authError}</p> : null}
+          </div>
+        )}
         {isPending ? (
           <div className="flex items-center gap-2 text-sm text-muted">
             <Spinner /> Loading…

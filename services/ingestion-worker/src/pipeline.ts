@@ -5,15 +5,21 @@ import { recordSource } from "./verify.js";
 
 const API_URL = process.env.API_URL ?? "http://localhost:3001";
 const INGEST_KEY = process.env.EVENT_INGEST_KEY ?? "";
+const OPERATOR_TOKEN = process.env.OPERATOR_TOKEN ?? "";
+
+export function workerHeaders(): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    ...(INGEST_KEY ? { "x-ingest-key": INGEST_KEY } : {}),
+    ...(OPERATOR_TOKEN ? { Authorization: `Bearer ${OPERATOR_TOKEN}` } : {}),
+  };
+}
 
 async function publish(name: string, callId: string, payload: unknown): Promise<void> {
   try {
     await fetch(`${API_URL}/api/events/publish`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(INGEST_KEY ? { "x-ingest-key": INGEST_KEY } : {}),
-      },
+      headers: workerHeaders(),
       body: JSON.stringify({ name, callId, payload }),
     });
   } catch {
