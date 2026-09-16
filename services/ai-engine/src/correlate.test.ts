@@ -58,4 +58,24 @@ describe("correlationScore", () => {
     expect(isCandidate({ score: 0.55, signals: [] })).toBe(true);
     expect(isCandidate({ score: 0.549, signals: [] })).toBe(false);
   });
+
+  it("adds a geo-near signal for coordinates within 25 km", () => {
+    // Sitabuldi ↔ Dharampeth are ~2 km apart in Nagpur.
+    const r = correlationScore(
+      { text: "fire", lat: 21.1495, lon: 79.0800 },
+      { text: "fire", lat: 21.1390, lon: 79.0700 },
+    );
+    expect(r.signals.some((s) => s.startsWith("geo-near:"))).toBe(true);
+    // Nagpur ↔ Mumbai (~840 km) earns nothing.
+    const far = correlationScore(
+      { text: "fire", lat: 21.1495, lon: 79.0800 },
+      { text: "fire", lat: 19.0760, lon: 72.8777 },
+    );
+    expect(far.signals.some((s) => s.startsWith("geo-near:"))).toBe(false);
+  });
+
+  it("ignores missing coordinates without crashing", () => {
+    const r = correlationScore({ text: "fire", lat: null }, { text: "fire" });
+    expect(r.signals.some((s) => s.startsWith("geo-near:"))).toBe(false);
+  });
 });

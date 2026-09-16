@@ -1,7 +1,7 @@
 import { correlationScore, fallbackExtract, isCandidate } from "@rakshak/ai-engine";
 import { onQueue } from "./queue.js";
 import type { SourceReport } from "./sources.js";
-import { seedIncident, verificationFor } from "./verify.js";
+import { recordSource } from "./verify.js";
 
 const API_URL = process.env.API_URL ?? "http://localhost:3001";
 const INGEST_KEY = process.env.EVENT_INGEST_KEY ?? "";
@@ -29,6 +29,8 @@ interface IncidentSnapshot {
   time?: string;
   incidentType?: string;
   weapon?: string | null;
+  lat?: number | null;
+  lon?: number | null;
 }
 
 async function recentIncidents(): Promise<IncidentSnapshot[]> {
@@ -44,6 +46,8 @@ async function recentIncidents(): Promise<IncidentSnapshot[]> {
       time: r.created_at,
       incidentType: r.extraction?.incident_type,
       weapon: r.extraction?.weapon_type ?? null,
+      lat: r.extraction?.geo?.lat ?? null,
+      lon: r.extraction?.geo?.lon ?? null,
     }));
   } catch {
     return [];
@@ -110,8 +114,7 @@ export function registerPipeline(): void {
       return;
     }
     for (const match of matches) {
-      seedIncident(match.incident_id);
-      const verification = verificationFor(match.incident_id, 1);
+      const verification = await recordSource(match.incident_id, report, match.score, match.signals);
       await publish("ai.explanation.updated", match.call_id, {
         report_id: report.id,
         report_source: report.source,

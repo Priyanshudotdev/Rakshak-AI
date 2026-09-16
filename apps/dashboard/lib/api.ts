@@ -77,6 +77,25 @@ export async function getDispatchLog(): Promise<import("./types").DispatchEntry[
   return body?.log ?? body?.data ?? [];
 }
 
+const OPERATOR_KEY = "rakshak.operator";
+
+/** Operator callsign for the audit trail (stored locally, sent as x-operator). */
+export function operatorName(): string {
+  try {
+    return (localStorage.getItem(OPERATOR_KEY) ?? "").trim().slice(0, 100) || "operator";
+  } catch {
+    return "operator";
+  }
+}
+
+export function setOperatorName(name: string): void {
+  try {
+    localStorage.setItem(OPERATOR_KEY, name.trim().slice(0, 100));
+  } catch {
+    /* private mode — audit falls back to "operator" */
+  }
+}
+
 export async function postDispatch(entry: {
   call_id?: string;
   location?: string;
@@ -86,7 +105,7 @@ export async function postDispatch(entry: {
 }) {
   const res = await fetch(`${API_URL}/api/dispatch`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "x-operator": operatorName() },
     body: JSON.stringify(entry),
   });
   return json<{ status: string; data: import("./types").DispatchEntry; log: import("./types").DispatchEntry[] }>(res);
@@ -102,7 +121,10 @@ export async function synthesize(text: string, opts?: { language_code?: string; 
 }
 
 export async function deleteRecord(id: string) {
-  const res = await fetch(`${API_URL}/api/records/${encodeURIComponent(id)}`, { method: "DELETE" });
+  const res = await fetch(`${API_URL}/api/records/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: { "x-operator": operatorName() },
+  });
   return json<{ status: string; message: string }>(res);
 }
 

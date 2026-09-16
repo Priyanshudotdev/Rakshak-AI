@@ -16,6 +16,8 @@ uploads/
 data/records.json
 data/records.json.corrupt
 data/dispatch_log.json
+data/incident_sources.json
+data/audit_log.json
 
 # IDE
 .vscode/

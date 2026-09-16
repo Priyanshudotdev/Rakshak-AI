@@ -10,9 +10,11 @@ import {
   getHealth,
   getRecordCount,
   listRecords,
+  operatorName,
   postDispatch,
   processAudioFile,
   processCall,
+  setOperatorName,
   synthesize,
 } from "../lib/api";
 import type { LiveEvent } from "../lib/live";
@@ -401,6 +403,16 @@ function RecordDetail({ record, events }: { record: IncidentRecord | null; event
               <KV k="Danger" v={ext.immediate_danger ? `yes · risk ${ext.risk_level ?? "?"}` : "no"} />
               <KV k="Caller" v={`${ext.caller_state ?? "unknown"} · ${ext.caller_gender ?? "?"}`} />
             </dl>
+            {ext.geo && Number.isFinite(ext.geo.lat) && Number.isFinite(ext.geo.lon) ? (
+              <div className="mt-2 overflow-hidden rounded-md2 border border-line">
+                <iframe
+                  title={`Map of ${ext.location ?? "incident"}`}
+                  src={`https://www.openstreetmap.org/export/embed.html?bbox=${ext.geo.lon - 0.02}%2C${ext.geo.lat - 0.015}%2C${ext.geo.lon + 0.02}%2C${ext.geo.lat + 0.015}&layer=mapnik&marker=${ext.geo.lat}%2C${ext.geo.lon}`}
+                  className="h-44 w-full border-0"
+                  loading="lazy"
+                />
+              </div>
+            ) : null}
             <a href={osm} target="_blank" rel="noreferrer" className="mt-2 inline-block text-xs text-accentlight hover:underline">
               Open location in OpenStreetMap ↗
             </a>
@@ -523,10 +535,24 @@ function RecordDetail({ record, events }: { record: IncidentRecord | null; event
 function DispatchPanel() {
   const { data, isPending } = useQuery({ queryKey: ["dispatch"], queryFn: getDispatchLog, refetchInterval: 5000 });
   const log: DispatchEntry[] = Array.isArray(data) ? data : [];
+  const [callsign, setCallsign] = useState(operatorName());
   return (
     <Card>
       <CardHead title="Dispatch log" sub="Operator decisions — auditable" right={<Badge tone="info">{log.length}</Badge>} />
       <CardBody>
+        <label className="mb-2 flex items-center gap-2 text-xs text-muted">
+          Callsign
+          <input
+            value={callsign}
+            onChange={(e) => {
+              setCallsign(e.target.value);
+              setOperatorName(e.target.value);
+            }}
+            placeholder="operator"
+            maxLength={100}
+            className="w-full rounded-md2 border border-line bg-ink px-2 py-1 text-xs text-cream outline-none placeholder:text-muted"
+          />
+        </label>
         {isPending ? (
           <div className="flex items-center gap-2 text-sm text-muted">
             <Spinner /> Loading…
@@ -545,7 +571,7 @@ function DispatchPanel() {
                   {d.incident_type ?? "Unknown"} — {d.location ?? "Not identified"}
                 </p>
                 <p className="text-muted">
-                  {d.call_id ?? ""} · {d.units ?? ""}
+                  {d.call_id ?? ""} · {d.units ?? ""}{d.operator ? ` · ${d.operator}` : ""}
                 </p>
               </li>
             ))}

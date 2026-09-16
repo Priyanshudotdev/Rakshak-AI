@@ -12,10 +12,10 @@ const file = await import("./store.js");
 const pgstore = await import("./pgstore.js");
 const { computeAnalytics } = await import("./analytics.js");
 
-const MIGRATION = readFileSync(
-  fileURLToPath(new URL("../../../database/migrations/002_records_store.sql", import.meta.url)),
-  "utf-8",
-);
+// All live migrations, exactly as production applies them in order.
+const MIGRATION = ["002_records_store.sql", "003_verification_sources.sql", "004_audit_log.sql"]
+  .map((f) => readFileSync(fileURLToPath(new URL(`../../../database/migrations/${f}`, import.meta.url)), "utf-8"))
+  .join("\n");
 
 let pool: PoolLike;
 
@@ -112,6 +112,57 @@ describe("pgstore (Postgres backend)", () => {
     // 207 sequential pg-mem round-trips; marginal on loaded machines.
     90_000,
   );
+
+  it("ledgers corroborating sources with file-store parity", async () => {
+    const src = { report_id: "R-1", source: "fixture", title: "Fire at Sitabuldi", correlation_score: 0.63, signals: ["location-match"] };
+    const [a, b] = [
+      await file.addIncidentSource("INC-9", structuredClone(src)),
+      await pgstore.addIncidentSource("INC-9", structuredClone(src)),
+    ];
+    expect(b).toEqual(a);
+    expect(b.verification).toBe("multiple_reports");
+    expect(b.reports).toBe(2);
+    expect(b.evidence[0]).toMatchObject({ report_id: "R-1", report_source: "fixture" });
+    // Idempotent re-post of the same report: no double count.
+    expect((await pgstore.addIncidentSource("INC-9", structuredClone(src))).reports).toBe(2);
+    expect((await file.addIncidentSource("INC-9", structuredClone(src))).reports).toBe(2);
+  });
+
+  it("climbs the verification ladder identically in both backends", async () => {
+    for (const [store, key] of [[file, "F-LADDER"], [pgstore, "P-LADDER"]] as const) {
+      expect((await store.getIncidentVerification(key)).verification).toBe("unverified");
+      await store.addIncidentSource(key, { report_id: "R-1" });
+      await store.addIncidentSource(key, { report_id: "R-2" });
+      await store.addIncidentSource(key, { report_id: "R-3" });
+      const v = await store.getIncidentVerification(key);
+      expect(v.reports).toBe(4);
+      expect(v.verification).toBe("corroborated");
+    }
+  });
+
+  it("trails operator actions with file-store parity", async () => {
+    const input = { actor: "ops-test", action: "dispatch", entity: "incident", entity_id: "LIVE-1", detail: { units: "P-1" } };
+    const [a, b] = [await file.appendAudit(input), await pgstore.appendAudit(input)];
+    expect(b.map(({ id: _a, created_at: _b, ...rest }) => rest)).toEqual(
+      a.map(({ id: _c, created_at: _d, ...rest }) => rest),
+    );
+    expect(b[0]).toMatchObject({ actor: "ops-test", action: "dispatch", entity_id: "LIVE-1" });
+    expect((await pgstore.getAuditLog(1))).toHaveLength(1);
+    // Actor defaults to operator when omitted.
+    const anon = await file.appendAudit({ action: "record.delete", entity_id: "X" });
+    expect(anon[0].actor).toBe("operator");
+  });
+
+  it("patches geo onto records identically in both backends", async () => {
+    await file.saveRecord(seedInput({ call_id: "GEO-F" }));
+    await pgstore.saveRecord(seedInput({ call_id: "GEO-P" }));
+    const geo = { lat: 21.1495, lon: 79.08, display: "Sitabuldi, Nagpur" };
+    expect(await file.updateRecordGeo("GEO-F", geo)).toBe(true);
+    expect(await pgstore.updateRecordGeo("GEO-P", geo)).toBe(true);
+    expect((await file.getRecord("GEO-F"))?.extraction?.geo).toEqual(geo);
+    expect((await pgstore.getRecord("GEO-P"))?.extraction?.geo).toEqual(geo);
+    expect(await pgstore.updateRecordGeo("GHOST", geo)).toBe(false);
+  });
 
   it("stamps the returned entry with its dispatch id (file-store parity)", async () => {
     const entry: Record<string, unknown> = { call_id: "E-1" };

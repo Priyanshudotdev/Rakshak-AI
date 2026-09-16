@@ -13,10 +13,17 @@ export interface Priority {
   rule_floor?: string;
 }
 
+export interface GeoPoint {
+  lat: number;
+  lon: number;
+  display?: string;
+}
+
 export interface Extraction {
   location?: string;
   landmark?: string;
   address?: string;
+  geo?: GeoPoint;
   incident_type?: string;
   incident_secondary?: string;
   people_involved?: string;
@@ -74,6 +81,7 @@ export interface DispatchEntry {
   incident_type?: string;
   priority?: string;
   units?: string;
+  operator?: string;
 }
 
 export type PriorityLevel = "HIGH" | "MEDIUM" | "LOW" | "CRITICAL";

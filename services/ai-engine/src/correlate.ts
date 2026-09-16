@@ -9,6 +9,17 @@ export interface Correlian {
   time?: string | number;
   incidentType?: string;
   weapon?: string | null;
+  lat?: number | null;
+  lon?: number | null;
+}
+
+function haversineKm(aLat: number, aLon: number, bLat: number, bLon: number): number {
+  const rad = (d: number) => (d * Math.PI) / 180;
+  const dLat = rad(bLat - aLat);
+  const dLon = rad(bLon - aLon);
+  const h =
+    Math.sin(dLat / 2) ** 2 + Math.cos(rad(aLat)) * Math.cos(rad(bLat)) * Math.sin(dLon / 2) ** 2;
+  return 2 * 6371 * Math.asin(Math.sqrt(h));
 }
 
 export interface CorrelationResult {
@@ -84,6 +95,21 @@ export function correlationScore(a: Correlian, b: Correlian): CorrelationResult 
   if (wA && wA === wB) {
     score += 0.05;
     signals.push(`weapon:${wA}`);
+  }
+
+  // 5. Geo signal: coordinates within 25 km agree (0.10 weight). Independent
+  // of the text location match — catches same-place/different-spelling.
+  if (
+    Number.isFinite(a.lat ?? NaN) &&
+    Number.isFinite(a.lon ?? NaN) &&
+    Number.isFinite(b.lat ?? NaN) &&
+    Number.isFinite(b.lon ?? NaN)
+  ) {
+    const km = haversineKm(a.lat as number, a.lon as number, b.lat as number, b.lon as number);
+    if (km <= 25) {
+      score += 0.1;
+      signals.push(`geo-near:${km.toFixed(1)}km`);
+    }
   }
 
   return { score: Math.round(Math.min(1, score) * 100) / 100, signals };

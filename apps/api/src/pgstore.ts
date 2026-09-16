@@ -1,14 +1,16 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { selectedPool } from "./db.js";
-import { computeAnalytics } from "./analytics.js";
+import { computeAnalytics, verificationStatus } from "./analytics.js";
 import type { Doc } from "./store.js";
 
 // Postgres backend with file-store-identical semantics (see pgstore.test.ts
-// equivalence coverage). DDL comes from database/migrations/002_records_store.sql
-// — the same file applied in production — so tests and prod cannot drift.
+// equivalence coverage). DDL comes from database/migrations/002_* and 003_*
+// — the same files applied in production — so tests and prod cannot drift.
 
 let schemaReady = false;
+
+const MIGRATIONS = ["002_records_store.sql", "003_verification_sources.sql", "004_audit_log.sql"];
 
 function pool() {
   const p = selectedPool();
@@ -18,7 +20,9 @@ function pool() {
 
 async function ensureSchema(): Promise<void> {
   if (schemaReady) return;
-  const sql = readFileSync(new URL("../../../database/migrations/002_records_store.sql", import.meta.url), "utf-8")
+  const sql = MIGRATIONS.map((f) =>
+    readFileSync(new URL(`../../../database/migrations/${f}`, import.meta.url), "utf-8"),
+  ).join("\n")
     // Strip -- comments: the test double (pg-mem) cannot parse leading or
     // trailing comment text; real Postgres is unaffected by their absence.
     .replace(/--[^\n]*/g, "");
@@ -173,6 +177,15 @@ export async function countRecords(): Promise<number> {
   return Number(res.rows[0]?.n ?? 0);
 }
 
+export async function updateRecordGeo(id: string, geo: Doc): Promise<boolean> {
+  await ensureSchema();
+  const current = await getRecord(id);
+  if (!current) return false;
+  current.extraction = { ...(current.extraction ?? {}), geo };
+  await pool().query("UPDATE records SET data = $2 WHERE id = $1 OR call_id = $1", [id, JSON.stringify(current)]);
+  return true;
+}
+
 export async function updateRecordDispatch(id: string, entry: Doc): Promise<boolean> {
   await ensureSchema();
   const current = await getRecord(id);
@@ -193,6 +206,95 @@ export async function getDispatchLog(): Promise<Doc[]> {
   await ensureSchema();
   const res = await pool().query("SELECT data FROM dispatch_log ORDER BY created_at DESC, id DESC");
   return res.rows.map((r) => asDoc(r.data));
+}
+
+export interface SourceInput {
+  report_id: string;
+  source?: string;
+  title?: string;
+  correlation_score?: number;
+  signals?: string[];
+}
+
+/** Durable corroboration ledger (§19): idempotent per report, status derives
+ *  from distinct-report counts + 1 for the original call. */
+export async function addIncidentSource(incidentKey: string, input: SourceInput): Promise<{ verification: string; reports: number; evidence: Doc[] }> {
+  await ensureSchema();
+  await pool().query(
+    `INSERT INTO incident_sources (id, incident_key, report_id, source, title, correlation_score, signals)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (incident_key, report_id) DO UPDATE SET
+       source = EXCLUDED.source, title = EXCLUDED.title,
+       correlation_score = EXCLUDED.correlation_score, signals = EXCLUDED.signals`,
+    [
+      randomUUID(),
+      incidentKey,
+      input.report_id,
+      String(input.source ?? "unknown").slice(0, 100),
+      String(input.title ?? "").slice(0, 500),
+      Number(input.correlation_score ?? 0),
+      JSON.stringify(input.signals ?? []),
+    ],
+  );
+  return getIncidentVerification(incidentKey);
+}
+
+export interface AuditInput {
+  actor?: string;
+  action: string;
+  entity?: string;
+  entity_id?: string;
+  detail?: unknown;
+}
+
+export async function appendAudit(input: AuditInput): Promise<Doc[]> {
+  await ensureSchema();
+  await pool().query(
+    "INSERT INTO api_audit_log (id, actor, action, entity, entity_id, detail) VALUES ($1, $2, $3, $4, $5, $6)",
+    [
+      `AUD-${Date.now().toString(36).toUpperCase()}-${randomBytes(2).toString("hex").toUpperCase()}`,
+      String(input.actor ?? "operator").slice(0, 100),
+      String(input.action).slice(0, 100),
+      String(input.entity ?? "").slice(0, 100),
+      String(input.entity_id ?? "").slice(0, 200),
+      JSON.stringify(input.detail ?? {}),
+    ],
+  );
+  return getAuditLog(50);
+}
+
+export async function getAuditLog(limit = 50): Promise<Doc[]> {
+  await ensureSchema();
+  const res = await pool().query(
+    "SELECT id, created_at, actor, action, entity, entity_id, detail FROM api_audit_log ORDER BY created_at DESC, id DESC LIMIT $1",
+    [Math.max(1, Math.min(limit, 500))],
+  );
+  return res.rows.map((r) => ({
+    id: r.id,
+    created_at: r.created_at,
+    actor: r.actor,
+    action: r.action,
+    entity: r.entity,
+    entity_id: r.entity_id,
+    detail: typeof r.detail === "string" ? JSON.parse(r.detail) : (r.detail ?? {}),
+  }));
+}
+
+export async function getIncidentVerification(incidentKey: string): Promise<{ verification: string; reports: number; evidence: Doc[] }> {
+  await ensureSchema();
+  const res = await pool().query(
+    "SELECT report_id, source, title, correlation_score, signals FROM incident_sources WHERE incident_key = $1 ORDER BY correlation_score DESC",
+    [incidentKey],
+  );
+  const evidence = res.rows.map((r) => ({
+    report_id: r.report_id,
+    report_source: r.source,
+    report_title: r.title,
+    correlation_score: Number(r.correlation_score ?? 0),
+    signals: typeof r.signals === "string" ? JSON.parse(r.signals) : (r.signals ?? []),
+  }));
+  const reports = evidence.length + 1; // +1 for the original call report
+  return { verification: verificationStatus(reports), reports, evidence };
 }
 
 /** Max-suffix dispatch ids — count-based ids collide after the 200-cap trim. */

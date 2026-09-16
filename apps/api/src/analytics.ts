@@ -4,6 +4,17 @@
 
 export type Rec = { [key: string]: any };
 
+export type VerificationStatus = "unverified" | "multiple_reports" | "corroborated";
+
+/** Verification ladder (§19): total includes the original call report, so the
+ *  first external source already means multiple_reports. officially_confirmed
+ *  is never derived here — operators set it through dispatch only. */
+export function verificationStatus(totalReports: number): VerificationStatus {
+  if (totalReports >= 4) return "corroborated";
+  if (totalReports >= 2) return "multiple_reports";
+  return "unverified";
+}
+
 export function computeAnalytics(records: Rec[]): Rec {
   if (!records.length) {
     return {

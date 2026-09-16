@@ -4,7 +4,7 @@ import Fastify from "fastify";
 import multipart from "@fastify/multipart";
 import websocket from "@fastify/websocket";
 import { z } from "zod";
-import { processAudio, processText, sarvam } from "@rakshak/ai-engine";
+import { geocodeArea, processAudio, processText, sarvam } from "@rakshak/ai-engine";
 import { config } from "@rakshak/config";
 import { log } from "@rakshak/logger";
 import { publishEvent, registerEventRoutes } from "./events.js";
@@ -37,6 +37,20 @@ function serverError(err: unknown) {
   // detail so the next Neon/LLM blip is debuggable without log access.
   const detail = (err instanceof Error ? err.message : String(err ?? "")).slice(0, 300);
   return { code: 500, body: { status: "error", message: "Processing failed on the server", detail } };
+}
+
+/** Best-effort geo enrichment: resolves the extracted area to coordinates and
+ *  patches the saved record. Never blocks or fails the call path. */
+function attachGeo(id: string, location?: string, landmark?: string): void {
+  if (!location || location === "Not identified") return;
+  void (async () => {
+    try {
+      const geo = await geocodeArea(location, landmark);
+      if (geo) await store.updateRecordGeo(id, geo);
+    } catch {
+      /* text location remains the source of truth */
+    }
+  })();
 }
 
 /** Fan out to live subscribers. Never throws — the batch response must not depend on WS. */
@@ -85,6 +99,7 @@ app.post("/api/process-call", async (req, reply) => {
     const saved = await store.saveRecord(result);
     result.id = saved.id;
     emitIncidentEvents(result);
+    attachGeo(saved.id, result.extraction?.location, result.extraction?.landmark);
     return { status: "success", data: result };
   } catch (err) {
     log("error", "process-call failed", { err: String(err), stack: err instanceof Error ? err.stack?.slice(0, 2000) : undefined });
@@ -107,6 +122,7 @@ app.post("/api/process-audio", async (req, reply) => {
     const saved = await store.saveRecord(result);
     result.id = saved.id;
     emitIncidentEvents(result);
+    attachGeo(saved.id, result.extraction?.location, result.extraction?.landmark);
     return { status: "success", data: result };
   } catch (err) {
     log("error", "process-audio failed", { err: String(err), stack: err instanceof Error ? err.stack?.slice(0, 2000) : undefined });
@@ -176,6 +192,7 @@ app.delete("/api/records/:id", async (req, reply) => {
   const { id } = req.params as { id: string };
   const ok = await store.deleteRecord(id);
   if (!ok) return reply.code(404).send({ status: "error", message: "Record not found" });
+  await store.appendAudit({ actor: actorOf(req), action: "record.delete", entity: "record", entity_id: id });
   return { status: "success", message: "Record deleted" };
 });
 
@@ -212,10 +229,58 @@ app.post("/api/tts", async (req, reply) => {
   }
 });
 
+const sourceSchema = z.object({
+  report_id: z.string().min(1, "report_id is required"),
+  source: z.string().max(100).optional(),
+  title: z.string().max(500).optional(),
+  correlation_score: z.number().min(0).max(1).optional(),
+  signals: z.array(z.string()).max(20).optional(),
+});
+
+// Durable corroboration ledger (§19): idempotent per report; the worker posts
+// here instead of counting in memory, so verification survives restarts.
+app.post("/api/incidents/:key/sources", async (req, reply) => {
+  const { key } = req.params as { key: string };
+  const parsed = sourceSchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ status: "error", message: "report_id is required" });
+  try {
+    const data = await store.addIncidentSource(key, parsed.data);
+    await store.appendAudit({ actor: actorOf(req), action: "source.attach", entity: "incident", entity_id: key, detail: parsed.data });
+    return { status: "success", data };
+  } catch (err) {
+    log("error", "add-source failed", { err: String(err) });
+    const e = serverError(err);
+    return reply.code(e.code).send(e.body);
+  }
+});
+
+app.get("/api/incidents/:key/verification", async (req, reply) => {
+  const { key } = req.params as { key: string };
+  try {
+    return { status: "success", data: await store.getIncidentVerification(key) };
+  } catch (err) {
+    const e = serverError(err);
+    return reply.code(e.code).send(e.body);
+  }
+});
+
 app.get("/api/dispatch", async () => store.getDispatchLog());
+
+function actorOf(req: { headers: Record<string, string | string[] | undefined> }): string {
+  const h = req.headers["x-operator"];
+  const actor = Array.isArray(h) ? h[0] : h;
+  return (actor ?? "operator").toString().slice(0, 100) || "operator";
+}
+
+app.get("/api/audit", async (req) => {
+  const q = req.query as { limit?: string };
+  const limit = Math.max(1, Math.min(Number(q.limit ?? 50) || 50, 500));
+  return { status: "success", data: await store.getAuditLog(limit) };
+});
 
 app.post("/api/dispatch", async (req) => {
   const body = (req.body ?? {}) as Record<string, any>;
+  const actor = actorOf(req);
   const entry = {
     time: new Date().toLocaleTimeString("en-GB", { hour12: false }),
     call_id: body.call_id ?? "LIVE",
@@ -223,10 +288,12 @@ app.post("/api/dispatch", async (req) => {
     incident_type: body.incident_type ?? "Unknown",
     priority: body.priority ?? "MEDIUM",
     units: body.units ?? "Patrol unit assigned",
+    operator: actor,
   };
   const entryLog = await store.appendDispatchEntry(entry);
   await store.updateRecordDispatch(entry.call_id, entry);
-  return { status: "success", data: entry, log: entryLog };
+  const audit = await store.appendAudit({ actor, action: "dispatch", entity: "incident", entity_id: entry.call_id, detail: entry });
+  return { status: "success", data: entry, log: entryLog, audit: audit.slice(0, 5) };
 });
 
 const port = config.port;

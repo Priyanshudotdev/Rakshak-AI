@@ -1,8 +1,8 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { computeAnalytics } from "./analytics.js";
+import { computeAnalytics, verificationStatus } from "./analytics.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 // apps/api/src -> repo root = ../../..
@@ -10,6 +10,7 @@ const ROOT = path.resolve(here, "..", "..", "..");
 const DATA_DIR = process.env.DATA_DIR ?? path.join(ROOT, "data");
 const RECORDS_FILE = path.join(DATA_DIR, "records.json");
 const DISPATCH_FILE = path.join(DATA_DIR, "dispatch_log.json");
+const SOURCES_FILE = path.join(DATA_DIR, "incident_sources.json");
 
 export type Doc = { [key: string]: any };
 
@@ -152,6 +153,19 @@ export async function updateRecordDispatch(id: string, entry: Doc): Promise<bool
   return hit;
 }
 
+export async function updateRecordGeo(id: string, geo: Doc): Promise<boolean> {
+  const records = await loadRaw();
+  let hit = false;
+  for (const r of records) {
+    if (r.id === id || r.call_id === id) {
+      r.extraction = { ...(r.extraction ?? {}), geo };
+      hit = true;
+    }
+  }
+  if (hit) await saveRaw(records);
+  return hit;
+}
+
 export async function getAnalytics(): Promise<Doc> {
   return computeAnalytics(await loadRaw());
 }
@@ -164,6 +178,116 @@ export async function getDispatchLog(): Promise<Doc[]> {
   } catch {
     return [];
   }
+}
+
+export interface SourceInput {
+  report_id: string;
+  source?: string;
+  title?: string;
+  correlation_score?: number;
+  signals?: string[];
+}
+
+async function loadSources(): Promise<Doc[]> {
+  try {
+    const content = await fs.readFile(SOURCES_FILE, "utf-8");
+    const data: unknown = JSON.parse(content);
+    return Array.isArray(data) ? (data as Doc[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveSources(rows: Doc[]): Promise<void> {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  const tmp = `${SOURCES_FILE}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(rows, null, 2), "utf-8");
+  await fs.rename(tmp, SOURCES_FILE);
+}
+
+function toEvidence(row: Doc): Doc {
+  return {
+    report_id: row.report_id,
+    report_source: row.source,
+    report_title: row.title,
+    correlation_score: Number(row.correlation_score ?? 0),
+    signals: row.signals ?? [],
+  };
+}
+
+/** File mirror of the pg incident_sources ledger: same idempotency + ladder. */
+export async function addIncidentSource(incidentKey: string, input: SourceInput): Promise<{ verification: string; reports: number; evidence: Doc[] }> {
+  const rows = await loadSources();
+  const row: Doc = {
+    id: randomUUID(),
+    incident_key: incidentKey,
+    report_id: input.report_id,
+    source: String(input.source ?? "unknown").slice(0, 100),
+    title: String(input.title ?? "").slice(0, 500),
+    correlation_score: Number(input.correlation_score ?? 0),
+    signals: input.signals ?? [],
+    created_at: new Date().toISOString(),
+  };
+  const idx = rows.findIndex((r) => r.incident_key === incidentKey && r.report_id === row.report_id);
+  if (idx >= 0) rows[idx] = { ...rows[idx], ...row, id: rows[idx].id, created_at: rows[idx].created_at };
+  else rows.push(row);
+  await saveSources(rows);
+  return getIncidentVerification(incidentKey);
+}
+
+export async function getIncidentVerification(incidentKey: string): Promise<{ verification: string; reports: number; evidence: Doc[] }> {
+  const rows = await loadSources();
+  const evidence = rows
+    .filter((r) => r.incident_key === incidentKey)
+    .sort((a, b) => Number(b.correlation_score ?? 0) - Number(a.correlation_score ?? 0))
+    .map(toEvidence);
+  const reports = evidence.length + 1;
+  return { verification: verificationStatus(reports), reports, evidence };
+}
+
+export interface AuditInput {
+  actor?: string;
+  action: string;
+  entity?: string;
+  entity_id?: string;
+  detail?: unknown;
+}
+
+const AUDIT_FILE = path.join(DATA_DIR, "audit_log.json");
+const AUDIT_CAP = 500;
+
+async function loadAudit(): Promise<Doc[]> {
+  try {
+    const content = await fs.readFile(AUDIT_FILE, "utf-8");
+    const data: unknown = JSON.parse(content);
+    return Array.isArray(data) ? (data as Doc[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** File mirror of api_audit_log: newest-first, capped. */
+export async function appendAudit(input: AuditInput): Promise<Doc[]> {
+  const rows = await loadAudit();
+  rows.unshift({
+    id: `AUD-${Date.now().toString(36).toUpperCase()}-${randomBytes(2).toString("hex").toUpperCase()}`,
+    created_at: new Date().toISOString(),
+    actor: String(input.actor ?? "operator").slice(0, 100),
+    action: String(input.action).slice(0, 100),
+    entity: String(input.entity ?? "").slice(0, 100),
+    entity_id: String(input.entity_id ?? "").slice(0, 200),
+    detail: input.detail ?? {},
+  });
+  const next = rows.slice(0, AUDIT_CAP);
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  const tmp = `${AUDIT_FILE}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(next, null, 2), "utf-8");
+  await fs.rename(tmp, AUDIT_FILE);
+  return getAuditLog(50);
+}
+
+export async function getAuditLog(limit = 50): Promise<Doc[]> {
+  return (await loadAudit()).slice(0, Math.max(1, Math.min(limit, AUDIT_CAP)));
 }
 
 /** Next dispatch id from the max existing suffix — count-based ids collide after the 200-cap trim. */
