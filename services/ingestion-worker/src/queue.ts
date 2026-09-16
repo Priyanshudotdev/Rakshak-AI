@@ -37,7 +37,8 @@ async function redisUp(): Promise<boolean> {
     const client = new Redis(redisUrl(), {
       lazyConnect: true,
       enableReadyCheck: false,
-      maxRetriesPerRequest: 1,
+      // BullMQ workers block on connections: maxRetriesPerRequest must be null.
+      maxRetriesPerRequest: null,
       retryStrategy: () => null,
     });
     // Swallow connection errors: absence of Redis selects direct mode, not a crash.

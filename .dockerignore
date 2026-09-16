@@ -13,7 +13,7 @@ apps/*/dist/
 apps/*/.next/
 services/*/dist/
 packages/*/dist/
-C:\Users\priya\AppData\Local\Temp\
+tmp/
 *.log
 .DS_Store
 Thumbs.db

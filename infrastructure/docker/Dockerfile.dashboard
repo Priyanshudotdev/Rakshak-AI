@@ -10,6 +10,7 @@ RUN npm ci --no-audit --no-fund
 
 FROM deps AS build
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+COPY tsconfig.base.json ./
 COPY apps/dashboard ./apps/dashboard
 RUN npm run build --workspace @rakshak/dashboard
 
