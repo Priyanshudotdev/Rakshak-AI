@@ -12,5 +12,8 @@
     "sourceMap": true,
     "resolveJsonModule": true,
     "isolatedModules": true
-  }
+  },
+  // The Next.js dashboard has its own tsconfig (bundler resolution + JSX);
+  // its check is `npm run typecheck --workspace apps/dashboard`.
+  "exclude": ["apps/dashboard", "**/node_modules", "**/dist", "**/.next"]
 }

@@ -54,7 +54,7 @@ Uncertainty preserved: `estimate/range + confidence + source` (e.g. "maybe 2–3
 - REST (Fastify, Zod): Flask response shapes kept (`{status, data}`); live `GET /api/stream` (WS), `POST /api/events/publish` (optional `EVENT_INGEST_KEY`), `GET /api/events/recent`, `GET /api/metrics/latency` (avg/p50/p95 per §26 timing). Batch endpoints fan out `transcript.final → incident.created → priority.updated`; `POST /api/process-audio?callId=` links gateway legs to records.
 - Events (§13): in-memory bus + WS gateway today (Redis pub/sub when the worker fleet needs it); catalog in `packages/types` (`RakshakEvents`), envelope helper in `packages/events`.
 - DB: `001_core.sql` (Postgres + PostGIS + pgvector, §15 tables) for the geo/vector phase; `002_records_store.sql` (records + dispatch_log) backs the live API via `pgstore.ts`. Backend selector: Postgres when `DATABASE_URL` works, else the file store — identical semantics locked by `pgstore.test.ts` equivalence coverage (pg-mem, no Docker needed).
-- Validation: Zod on ingest routes; every LLM output JSON-parsed/validated before persist/emit; reject → rules fallback + `llm_used: rules`.
+- Validation: Zod on ingest routes; every LLM output JSON-parsed/validated before persist/emit; reject → rules fallback + `llm_used: rules`. Errors keep the `{status: "error"}` contract: 400s for bad input, 500s carry the generic message plus a truncated upstream `detail` (server logs keep the stack) so Neon/LLM blips are debuggable.
 - Tests (TDD, vitest): ai-engine (extract/priority/correlation), gateway sessions, worker (feeds/verify), api (pgstore equivalence), dashboard (verification mapper). `npm run test --workspaces --if-present`.
 
 ## 6. Latency / reliability implications
@@ -71,5 +71,6 @@ Uncertainty preserved: `estimate/range + confidence + source` (e.g. "maybe 2–3
 4. **Phase 3 Asterisk: CONFIGS DONE, live wiring pending.** `pjsip/ari/extensions` templates + nginx edge proxy; needs trunk + host to verify.
 5. **Phase 4 two-way: PARTIAL.** `tts-stop` barge-in event path exists; Bulbul injection into Asterisk audio pending on Phase 3.
 6. **Phase 5/6 aggregation: WORKER DONE, geo/vector pending.** RSS intake → six queues (direct-mode fallback) → offline-safe extraction → weighted correlation → verification ladder (operator-only confirmation). PostGIS/pgvector + dashboard correlation views are next.
+7. **Hardening/verification (2026-09-16, live on Neon):** Marathi `process-call` (Roman + Devanagari) green; TTS→STT audio roundtrip green; ingestion `RUN_ONCE` fixture smoke green in direct mode; root `typecheck` covers Node workspaces + dashboard's own `tsconfig` (base excludes the Next app); `next build` green (105 kB); `docker compose config` validates. Still blocked: compose boot + BullMQ Redis mode (no Docker daemon / local Redis here), Asterisk live wiring (needs trunk + host).
 
 Each step: types → events → migration → implementation → validation → docs update; never silently alter core architecture.

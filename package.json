@@ -9,7 +9,7 @@
     "packages/*"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.base.json",
+    "typecheck": "tsc --noEmit -p tsconfig.base.json && npm run typecheck --workspace apps/dashboard",
     "build": "npm run build --workspaces --if-present",
     "dev:api": "npm run dev --workspace apps/api",
     "dev:gateway": "npm run dev --workspace services/media-gateway"
