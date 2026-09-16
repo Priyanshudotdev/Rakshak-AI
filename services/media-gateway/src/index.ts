@@ -198,8 +198,64 @@ setInterval(() => {
 
 // Realtime legs (REALTIME=saaras): answer ARI Stasis calls and fork caller
 // audio into the Saaras adapter. Replay mode keeps the WS batch path above.
+let ari: AriController | null = null;
+
+/** Full loop for one final transcript: understand via process-call, then speak
+ *  a calm Marathi reply back into the caller's ear. All best-effort. */
+async function handleFinal(callId: string, text: string, language?: string): Promise<void> {
+  if (!ari || !text.trim()) return;
+  const channelId = ari.channelForCall(callId);
+  if (!channelId) return;
+  try {
+    await speak(channelId, "माहिती मिळाली, तपासत आहे.");
+    const res = await fetch(`${API_URL}/api/process-call`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ transcript: text, language: language ?? "Marathi" }),
+    });
+    if (!res.ok) return;
+    const body = (await res.json()) as {
+      data?: { extraction?: { incident_type?: string }; priority?: { level?: string } };
+    };
+    const incident = body.data?.extraction?.incident_type;
+    const reply =
+      incident && incident !== "Unknown"
+        ? `आपली तक्रार नोंदवली आहे. ${incident} साठी मदत पाठवत आहोत.`
+        : "आपली तक्रार नोंदवली आहे, मदत लवकरच पोहोचेल.";
+    await speak(channelId, reply);
+  } catch (err) {
+    log("warn", "final-loop failed", { callId, err: String(err) });
+  }
+}
+
+async function speak(channelId: string, text: string): Promise<void> {
+  if (!ari) return;
+  const res = await fetch(`${API_URL}/api/tts`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, language_code: "mr-IN" }),
+  });
+  if (!res.ok) return;
+  const body = (await res.json()) as { data?: { audio_base64?: string } };
+  const b64 = (body.data?.audio_base64 ?? "").split(",", 2)[1] ?? "";
+  if (!b64) return;
+  const wav = Buffer.from(b64, "base64");
+  const { parseWavHeader, resampleLinear16 } = await import("./ari.js");
+  const info = parseWavHeader(wav);
+  if (!info || info.channels !== 1 || info.bits !== 16) return;
+  const pcm = new Int16Array(wav.buffer, wav.byteOffset + info.dataOffset, (wav.length - info.dataOffset) / 2);
+  await ari.sendCallAudio(channelId, resampleLinear16(pcm, info.sampleRate, 16000));
+}
+
 if (adapter.kind === "saaras-realtime") {
-  const ari = new AriController({ publish, log, adapter });
+  ari = new AriController({
+    publish,
+    log,
+    adapter,
+    onFinalTranscript: (callId, text, language) => {
+      void handleFinal(callId, text, language);
+    },
+  });
   ari.start().catch((err) => log("warn", "ari controller failed", { err: String(err) }));
 }
 

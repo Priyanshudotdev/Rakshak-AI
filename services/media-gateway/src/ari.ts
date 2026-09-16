@@ -30,6 +30,48 @@ export interface AriHooks {
   publish(name: string, callId: string, payload: unknown): void;
   log(level: string, msg: string, fields?: Record<string, unknown>): void;
   adapter: RealtimeAdapter;
+  /** Full-loop handler: incident extraction + spoken reply for final transcripts. */
+  onFinalTranscript?: (callId: string, text: string, language?: string) => void;
+}
+
+interface RtpPeer {
+  address: string;
+  port: number;
+  seq: number;
+  timestamp: number;
+  ssrc: number;
+}
+
+/** Naive linear-interpolation resampler for mono int16 (test-harness grade). */
+export function resampleLinear16(samples: Int16Array, fromRate: number, toRate: number): Int16Array {
+  if (fromRate === toRate) return samples;
+  const ratio = fromRate / toRate;
+  const out = new Int16Array(Math.floor(samples.length / ratio));
+  for (let i = 0; i < out.length; i++) {
+    const pos = i * ratio;
+    const i0 = Math.floor(pos);
+    const frac = pos - i0;
+    const a = samples[i0] ?? 0;
+    const b = samples[Math.min(i0 + 1, samples.length - 1)] ?? 0;
+    out[i] = Math.round(a + (b - a) * frac);
+  }
+  return out;
+}
+
+/** Parse a WAV header; returns PCM16 mono info or null. */
+export function parseWavHeader(wav: Buffer): { dataOffset: number; sampleRate: number; channels: number; bits: number } | null {
+  try {
+    if (wav.length < 44 || wav.subarray(0, 4).toString() !== "RIFF") return null;
+    const view = new DataView(wav.buffer, wav.byteOffset, wav.byteLength);
+    return {
+      dataOffset: 44,
+      sampleRate: view.getUint32(24, true),
+      channels: view.getUint16(22, true),
+      bits: view.getUint16(34, true),
+    };
+  } catch {
+    return null;
+  }
 }
 
 interface Leg {
@@ -39,6 +81,7 @@ interface Leg {
   bridgeId: string;
   udp: UdpSocket;
   saaras: RealtimeSession;
+  rtpPort: number;
 }
 
 /** Strip an RTP header (handles CSRC list + one extension header). */
@@ -59,6 +102,7 @@ export class AriController {
   private ws: SocketLike | null = null;
   private nextRtpPort: number;
   private readonly legs = new Map<string, Leg>(); // by channel id
+  private readonly peers = new Map<number, RtpPeer>(); // by our UDP port
   // Sync claim set: onCall awaits network I/O before legs.set, so back-to-back
   // StasisStart events for one channel would double-fork without this.
   private readonly claimed = new Set<string>();
@@ -205,7 +249,14 @@ export class AriController {
 
     const saaras = await this.hooks.adapter.connect(callId, {
       onPartial: (text, language) => this.hooks.publish("transcript.partial", callId, { original_text: text, language: language ?? "Unknown" }),
-      onFinal: (text, language) => this.hooks.publish("transcript.final", callId, { original_text: text, language: language ?? "Unknown" }),
+      onFinal: (text, language) => {
+        this.hooks.publish("transcript.final", callId, { original_text: text, language: language ?? "Unknown" });
+        try {
+          this.hooks.onFinalTranscript?.(callId, text, language);
+        } catch (err) {
+          this.hooks.log("warn", "final handler failed", { callId, err: String(err) });
+        }
+      },
       onError: (err) => this.hooks.log("warn", "realtime error", { callId, err: String(err) }),
       onClose: () => undefined,
     });
@@ -213,7 +264,18 @@ export class AriController {
     // One UDP port per call: no SSRC demux needed, trivially testable.
     const rtpPort = this.nextRtpPort++;
     const udp = createSocket("udp4");
-    udp.on("message", (msg) => {
+    udp.on("message", (msg, rinfo) => {
+      if (rinfo && !this.peers.has(rtpPort)) {
+        // Learn the return path from the first packet: Asterisk sends from
+        // its RTP port, so TTS replies go back to exactly there.
+        this.peers.set(rtpPort, {
+          address: rinfo.address,
+          port: rinfo.port,
+          seq: Math.floor(Math.random() * 60000),
+          timestamp: Math.floor(Math.random() * 0xffffffff),
+          ssrc: Math.floor(Math.random() * 0xffffffff),
+        });
+      }
       const pcm = rtpPayload(msg);
       if (pcm.length) {
         try {
@@ -249,8 +311,46 @@ export class AriController {
       bridgeId: String(bridge.id),
       udp,
       saaras,
+      rtpPort,
     });
     this.hooks.log("info", "ari leg bridged", { callId, exten });
+  }
+
+  /** Resolve the ARI channel behind a call id (for the reply path). */
+  channelForCall(callId: string): string | null {
+    for (const [channelId, leg] of this.legs) {
+      if (leg.callId === callId) return channelId;
+    }
+    return null;
+  }
+
+  /** Send mono 16 kHz PCM16 into the call (TTS injection), paced in real time
+   *  in 20 ms frames. No-op until the first inbound packet teaches us the
+   *  return path. Fire-and-forget: resolves when fully played. */
+  async sendCallAudio(channelId: string, pcm16: Int16Array): Promise<void> {
+    const leg = this.legs.get(channelId);
+    const peer = leg ? this.peers.get(leg.rtpPort) : undefined;
+    if (!leg || !peer) return;
+    const FRAME = 320; // 20 ms @ 16 kHz
+    for (let i = 0; i < pcm16.length; i += FRAME) {
+      if (!this.legs.has(channelId)) return; // hung up mid-reply
+      const chunk = pcm16.subarray(i, i + FRAME);
+      const packet = Buffer.alloc(12 + chunk.length * 2);
+      packet[0] = 0x80;
+      packet[1] = 0x00;
+      packet.writeUInt16BE(peer.seq & 0xffff, 2);
+      packet.writeUInt32BE(peer.timestamp >>> 0, 4);
+      packet.writeUInt32BE(peer.ssrc >>> 0, 8);
+      for (let s = 0; s < chunk.length; s++) packet.writeInt16LE(chunk[s] ?? 0, 12 + s * 2);
+      peer.seq += 1;
+      peer.timestamp += chunk.length;
+      try {
+        leg.udp.send(packet, peer.port, peer.address);
+      } catch {
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 20));
+    }
   }
 
   /** Feed one RTP packet (unit-test seam; the UDP path calls the same code). */
@@ -272,6 +372,7 @@ export class AriController {
     this.claimed.delete(channelId);
     if (!leg) return;
     this.legs.delete(channelId);
+    this.peers.delete(leg.rtpPort);
     try {
       leg.saaras.close();
     } catch {

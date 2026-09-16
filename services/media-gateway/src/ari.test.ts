@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { AriController, rtpPayload, type SocketLike } from "./ari.js";
+import { AriController, parseWavHeader, resampleLinear16, rtpPayload, type SocketLike } from "./ari.js";
 import type { RealtimeAdapter } from "./saaras.js";
 
 class FakeSocket implements SocketLike {
@@ -45,6 +45,24 @@ describe("rtpPayload", () => {
   it("returns empty for short or truncated packets", () => {
     expect(rtpPayload(Buffer.from([1, 2])).length).toBe(0);
     expect(rtpPayload(Buffer.alloc(0)).length).toBe(0);
+  });
+});
+
+describe("tts helpers", () => {
+  it("resamples by linear interpolation", () => {
+    const out = resampleLinear16(new Int16Array([0, 100, 200, 300]), 4, 2);
+    expect([...out]).toEqual([0, 200]);
+    expect(resampleLinear16(new Int16Array([5]), 16000, 16000)).toEqual(new Int16Array([5]));
+  });
+
+  it("parses wav headers and rejects junk", () => {
+    const wav = Buffer.alloc(48);
+    wav.write("RIFF", 0);
+    wav.writeUInt16LE(1, 22);
+    wav.writeUInt32LE(22050, 24);
+    wav.writeUInt16LE(16, 34);
+    expect(parseWavHeader(wav)).toMatchObject({ dataOffset: 44, sampleRate: 22050, channels: 1, bits: 16 });
+    expect(parseWavHeader(Buffer.from("junk"))).toBeNull();
   });
 });
 
