@@ -82,6 +82,8 @@ interface Leg {
   udp: UdpSocket;
   saaras: RealtimeSession;
   rtpPort: number;
+  rxPackets: number;
+  rxBytes: number;
 }
 
 /** Strip an RTP header (handles CSRC list + one extension header). */
@@ -275,9 +277,13 @@ export class AriController {
           timestamp: Math.floor(Math.random() * 0xffffffff),
           ssrc: Math.floor(Math.random() * 0xffffffff),
         });
+        this.hooks.log("info", "rtp flowing", { callId, from: `${rinfo.address}:${rinfo.port}` });
       }
+      const leg = this.legs.get(channelId);
       const pcm = rtpPayload(msg);
-      if (pcm.length) {
+      if (leg && pcm.length) {
+        leg.rxPackets += 1;
+        leg.rxBytes += pcm.length;
         try {
           saaras.sendAudio(pcm);
         } catch {
@@ -312,6 +318,8 @@ export class AriController {
       udp,
       saaras,
       rtpPort,
+      rxPackets: 0,
+      rxBytes: 0,
     });
     this.hooks.log("info", "ari leg bridged", { callId, exten });
   }
@@ -371,6 +379,11 @@ export class AriController {
     const leg = this.legs.get(channelId);
     this.claimed.delete(channelId);
     if (!leg) return;
+    this.hooks.log("info", "ari leg stats", {
+      callId: leg.callId,
+      rxPackets: leg.rxPackets,
+      rxBytes: leg.rxBytes,
+    });
     this.legs.delete(channelId);
     this.peers.delete(leg.rtpPort);
     try {
