@@ -59,6 +59,9 @@ export class AriController {
   private ws: SocketLike | null = null;
   private nextRtpPort: number;
   private readonly legs = new Map<string, Leg>(); // by channel id
+  // Sync claim set: onCall awaits network I/O before legs.set, so back-to-back
+  // StasisStart events for one channel would double-fork without this.
+  private readonly claimed = new Set<string>();
   private stopped = false;
 
   constructor(hooks: AriHooks, opts: AriOptions = {}) {
@@ -186,7 +189,17 @@ export class AriController {
     // another fork until RTP ports exhaust and Asterisk falls over.
     if (channelName.startsWith("UnicastRTP/")) return;
     // Duplicate StasisStart for a leg we already own: ignore, never double-fork.
-    if (this.legs.has(channelId)) return;
+    if (this.legs.has(channelId) || this.claimed.has(channelId)) return;
+    this.claimed.add(channelId);
+    try {
+      await this.setupLeg(channelId, exten, caller);
+    } catch (err) {
+      this.claimed.delete(channelId);
+      throw err;
+    }
+  }
+
+  private async setupLeg(channelId: string, exten: string, caller: string): Promise<void> {
     const callId = `ARI-${channelId.slice(0, 8).toUpperCase()}`;
     this.hooks.publish("call.answered", callId, { via: "ari", exten, caller });
 
@@ -256,6 +269,7 @@ export class AriController {
 
   private async teardown(channelId: string): Promise<void> {
     const leg = this.legs.get(channelId);
+    this.claimed.delete(channelId);
     if (!leg) return;
     this.legs.delete(channelId);
     try {
