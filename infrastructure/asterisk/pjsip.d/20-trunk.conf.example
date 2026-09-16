@@ -25,6 +25,10 @@ qualify_frequency = 60
 [trunk](trunk-endpoint)
 outbound_auth = trunk-auth
 aors = trunk-aor
+rtp_symmetric = yes
+force_rport = yes
+rewrite_contact = yes
+ice_support = no
 
 [trunk-identify]
 type = identify
