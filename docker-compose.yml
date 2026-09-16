@@ -103,7 +103,10 @@ services:
     # andrius/asterisk runs Asterisk 20 foreground; our configs mount read-only.
     # Trunk (pjsip.d/20-trunk.conf) is intentionally NOT mounted — no provider
     # yet, and Asterisk cannot expand ${VAR} placeholders itself.
+    # Self-healing: this image segfaults (139) when RTP ports exhaust under
+    # rapid redials — restart policy revives it automatically.
     image: andrius/asterisk:latest
+    restart: unless-stopped
     ports:
       - "5060:5060/udp"
       - "5060:5060/tcp"
