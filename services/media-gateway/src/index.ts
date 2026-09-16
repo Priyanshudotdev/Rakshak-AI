@@ -72,7 +72,7 @@ async function finalize(callId: string, filename?: string): Promise<void> {
 const http = createServer((req: IncomingMessage, res: ServerResponse) => {
   if (req.url?.startsWith("/health")) {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", service: "media-gateway", mode: "replay", sessions: sessions.size }));
+    res.end(JSON.stringify({ status: "ok", service: "media-gateway", mode: adapter.kind === "passthrough" ? "replay" : "realtime", sessions: sessions.size }));
     return;
   }
   res.writeHead(404);
@@ -196,5 +196,5 @@ setInterval(() => {
 }, 15_000);
 
 http.listen(PORT, () => {
-  log("info", `media-gateway listening on :${PORT}`, { mode: "replay", api: API_URL });
+  log("info", `media-gateway listening on :${PORT}`, { mode: adapter.kind, api: API_URL });
 });
