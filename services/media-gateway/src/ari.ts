@@ -40,6 +40,8 @@ interface RtpPeer {
   seq: number;
   timestamp: number;
   ssrc: number;
+  /** Payload type Asterisk uses for this slin16 leg — learned inbound. */
+  pt: number;
 }
 
 /** Naive linear-interpolation resampler for mono int16 (test-harness grade). */
@@ -293,17 +295,20 @@ export class AriController {
     const rtpPort = this.nextRtpPort++;
     const udp = createSocket("udp4");
     udp.on("message", (msg, rinfo) => {
-      if (rinfo && !this.peers.has(rtpPort)) {
+      if (rinfo && msg.length >= 2 && !this.peers.has(rtpPort)) {
         // Learn the return path from the first packet: Asterisk sends from
-        // its RTP port, so TTS replies go back to exactly there.
+        // its RTP port, so TTS replies go back to exactly there — with the
+        // SAME payload type it uses (PT=0 hardcoded decodes as mu-law static).
+        const pt = msg[1] & 0x7f;
         this.peers.set(rtpPort, {
           address: rinfo.address,
           port: rinfo.port,
           seq: Math.floor(Math.random() * 60000),
           timestamp: Math.floor(Math.random() * 0xffffffff),
           ssrc: Math.floor(Math.random() * 0xffffffff),
+          pt,
         });
-        this.hooks.log("info", "rtp flowing", { callId, from: `${rinfo.address}:${rinfo.port}` });
+        this.hooks.log("info", "rtp flowing", { callId, from: `${rinfo.address}:${rinfo.port}`, pt });
       }
       const leg = this.legs.get(channelId);
       const pcm = rtpPayload(msg);
@@ -366,12 +371,14 @@ export class AriController {
     const peer = leg ? this.peers.get(leg.rtpPort) : undefined;
     if (!leg || !peer) return;
     const FRAME = 320; // 20 ms @ 16 kHz
+    let first = true;
     for (let i = 0; i < pcm16.length; i += FRAME) {
       if (!this.legs.has(channelId)) return; // hung up mid-reply
       const chunk = pcm16.subarray(i, i + FRAME);
       const packet = Buffer.alloc(12 + chunk.length * 2);
       packet[0] = 0x80;
-      packet[1] = 0x00;
+      packet[1] = (first ? 0x80 : 0x00) | (peer.pt & 0x7f);
+      first = false;
       packet.writeUInt16BE(peer.seq & 0xffff, 2);
       packet.writeUInt32BE(peer.timestamp >>> 0, 4);
       packet.writeUInt32BE(peer.ssrc >>> 0, 8);
