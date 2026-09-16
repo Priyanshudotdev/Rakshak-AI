@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { SessionManager } from "./session.js";
+import { AriController } from "./ari.js";
 import { createAdapter } from "./saaras.js";
 
 // Media Gateway (spec §7): Asterisk media <-> Sarvam STT transport + session mgmt.
@@ -194,6 +195,13 @@ setInterval(() => {
   }
   if (idle.length) log("info", "swept idle sessions", { count: idle.length });
 }, 15_000);
+
+// Realtime legs (REALTIME=saaras): answer ARI Stasis calls and fork caller
+// audio into the Saaras adapter. Replay mode keeps the WS batch path above.
+if (adapter.kind === "saaras-realtime") {
+  const ari = new AriController({ publish, log, adapter });
+  ari.start().catch((err) => log("warn", "ari controller failed", { err: String(err) }));
+}
 
 http.listen(PORT, () => {
   log("info", `media-gateway listening on :${PORT}`, { mode: adapter.kind, api: API_URL });

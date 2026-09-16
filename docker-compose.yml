@@ -53,6 +53,14 @@ services:
       EVENT_INGEST_KEY: ${EVENT_INGEST_KEY:-}
       PORT: 3002
       SARVAM_API_KEY: ${SARVAM_API_KEY:-}
+      # REALTIME=saaras activates the ARI leg: answer Stasis(rakshak) calls,
+      # fork slin16 audio to Sarvam realtime. Defaults below match this file.
+      REALTIME: ${REALTIME:-}
+      ARI_URL: http://asterisk:8088
+      ARI_APP: rakshak
+      ARI_USER: rakshak-gateway
+      ARI_PASSWORD: rakshak-ari-test-only
+      GATEWAY_RTP_HOST: media-gateway
     ports:
       - "3002:3002"
     depends_on:
