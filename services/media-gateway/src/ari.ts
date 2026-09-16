@@ -285,6 +285,9 @@ export class AriController {
     for (const [method, path] of [
       ["DELETE", `bridges/${leg.bridgeId}`],
       ["POST", `channels/${leg.channelId}/hangup`],
+      // The fork itself: without this it lingers in Stasis holding its RTP
+      // port, and repeated calls exhaust the range (the earlier crash).
+      ["POST", `channels/${leg.externalId}/hangup`],
     ] as const) {
       try {
         await this.rest(method, path);

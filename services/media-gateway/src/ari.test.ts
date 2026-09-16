@@ -127,12 +127,15 @@ describe("AriController", () => {
     expect(ctx.sentAudio).toHaveLength(1);
   });
 
-  it("tears down bridge and session on StasisEnd", async () => {
+  it("tears down bridge, caller and media fork on StasisEnd", async () => {
     const ctx = setup();
     const channelId = await startCall(ctx);
     ctx.socket().emit("message", JSON.stringify({ type: "StasisEnd", channel: { id: channelId } }));
     await new Promise((r) => setTimeout(r, 20));
     expect(ctx.calls.some((c) => c.method === "DELETE" && c.url.includes("bridges/bridge-1"))).toBe(true);
+    const hangups = ctx.calls.filter((c) => c.method === "POST" && c.url.includes("/hangup")).map((c) => c.url);
+    expect(hangups.some((u) => u.includes("chan-abc-12345678"))).toBe(true);
+    expect(hangups.some((u) => u.includes("ext-1"))).toBe(true);
     expect(ctx.published.at(-1)).toMatchObject({ name: "call.ended" });
   });
 
