@@ -96,20 +96,45 @@ export class AriController {
     }
   }
 
+  private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  private reconnectDelay = 3000;
+
   /** Connect (and stay connected with backoff). Resolves on first open. */
   async start(): Promise<void> {
     this.stopped = false;
+    this.reconnectDelay = 3000;
     await this.connectOnce();
-    if (!this.stopped) {
-      this.ws?.on("close", () => {
-        if (!this.stopped) {
-          this.hooks.log("warn", "ari disconnected, reconnecting");
-          setTimeout(() => {
-            if (!this.stopped) this.connectOnce().catch((err) => this.hooks.log("warn", "ari reconnect failed", { err: String(err) }));
-          }, 3000);
-        }
-      });
-    }
+    this.armReconnect();
+  }
+
+  private armReconnect(): void {
+    if (this.stopped) return;
+    this.ws?.on("close", () => {
+      if (this.stopped) return;
+      this.hooks.log("warn", "ari disconnected, reconnecting");
+      this.retryLoop();
+    });
+  }
+
+  /** Persistent retry with backoff: runs until the socket is back. */
+  private retryLoop(): void {
+    if (this.stopped || this.reconnectTimer) return;
+    const attempt = () => {
+      this.reconnectTimer = undefined;
+      if (this.stopped) return;
+      this.connectOnce().then(
+        () => {
+          this.reconnectDelay = 3000;
+          this.armReconnect();
+        },
+        (err: unknown) => {
+          this.hooks.log("warn", "ari reconnect failed", { err: String(err) });
+          this.reconnectDelay = Math.min(this.reconnectDelay * 2, 30_000);
+          this.retryLoop();
+        },
+      );
+    };
+    this.reconnectTimer = setTimeout(attempt, this.reconnectDelay);
   }
 
   private async connectOnce(): Promise<void> {
@@ -252,6 +277,8 @@ export class AriController {
   /** Stop reconnects and drop every leg (tests / shutdown). */
   async shutdown(): Promise<void> {
     this.stopped = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
     for (const id of [...this.legs.keys()]) await this.teardown(id);
     try {
       this.ws?.close();
