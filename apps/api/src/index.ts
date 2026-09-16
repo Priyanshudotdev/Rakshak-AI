@@ -314,6 +314,10 @@ app.get("/api/incidents/nearby", async (req, reply) => {
     );
     return { status: "success", data: res.rows, count: res.rows.length };
   } catch (err) {
+    // Compose postgres is record-store only (no 001/PostGIS) — say so plainly.
+    if (/st_dwithin|does not exist|extension/i.test(String(err))) {
+      return reply.code(400).send({ status: "error", message: "Geo search needs the PostGIS schema (001_core.sql) on this database" });
+    }
     const e = serverError(err);
     return reply.code(e.code).send(e.body);
   }
@@ -345,6 +349,9 @@ app.post("/api/incidents/similar", async (req, reply) => {
       count: res.rows.length,
     };
   } catch (err) {
+    if (/does not exist|extension|operator does not exist/i.test(String(err))) {
+      return reply.code(400).send({ status: "error", message: "Similarity search needs the pgvector schema (001_core.sql) on this database" });
+    }
     const e = serverError(err);
     return reply.code(e.code).send(e.body);
   }
