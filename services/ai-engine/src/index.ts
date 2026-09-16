@@ -5,6 +5,7 @@ export * from "./priority.js";
 export * from "./fallback.js";
 export * from "./correlate.js";
 export * from "./geocode.js";
+export * from "./embeddings.js";
 export * as sarvam from "./sarvam.js";
 export * as llm from "./llm.js";
 

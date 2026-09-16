@@ -204,6 +204,21 @@ describe("pgstore (Postgres backend)", () => {
     }
   });
 
+  it("rotates password hashes and revokes other sessions in both backends", async () => {
+    for (const s of [file, pgstore]) {
+      const op = await s.createOperator({ name: "Ops Rotate", passwordHash: "old-hash" });
+      expect(await s.updatePasswordHash(op.id, "new-hash")).toBe(true);
+      expect(await s.updatePasswordHash("ghost-id", "x")).toBe(false);
+      expect((await s.findOperatorByName("Ops Rotate"))?.password_hash).toBe("new-hash");
+      const future = new Date(Date.now() + 3600_000).toISOString();
+      await s.createSession(op.id, "tok-keep", future);
+      await s.createSession(op.id, "tok-drop", future);
+      await s.revokeOtherSessions(op.id, "tok-keep");
+      expect((await s.resolveSession("tok-keep"))?.name).toBe("Ops Rotate");
+      expect(await s.resolveSession("tok-drop")).toBeNull();
+    }
+  });
+
   it("stamps the returned entry with its dispatch id (file-store parity)", async () => {
     const entry: Record<string, unknown> = { call_id: "E-1" };
     await pgstore.appendDispatchEntry(entry);

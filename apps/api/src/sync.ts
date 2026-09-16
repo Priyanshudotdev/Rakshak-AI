@@ -1,5 +1,11 @@
+import { embedText } from "@rakshak/ai-engine";
 import type { PoolLike } from "./db.js";
 import type { Doc } from "./store.js";
+
+export interface SyncOptions {
+  /** Override for tests; default calls Gemini (null-safe, never throws). */
+  embed?: (text: string) => Promise<string | null>;
+}
 
 // Normalized backfill (§15): project the live `records` JSON blobs into the
 // relational + PostGIS schema (001) so geo/vector queries have real data.
@@ -60,7 +66,11 @@ export function buildNormalizedRows(record: Doc): NormalizedRows {
 }
 
 /** Upsert one record's rows. Returns the incident UUID (or null when skipped). */
-export async function syncRecord(pool: PoolLike, record: Doc): Promise<{ incidentId: string | null; skipped: boolean }> {
+export async function syncRecord(
+  pool: PoolLike,
+  record: Doc,
+  opts: SyncOptions = {},
+): Promise<{ incidentId: string | null; skipped: boolean }> {
   const row = buildNormalizedRows(record);
   if (!row.callId || row.callId === "unknown") return { incidentId: null, skipped: true };
 
@@ -122,6 +132,17 @@ export async function syncRecord(pool: PoolLike, record: Doc): Promise<{ inciden
       row.model,
     ]);
   }
+  // Vector hook: best-effort, skipped silently when embeddings are unavailable.
+  try {
+    const vector = await (opts.embed ?? embedText)(
+      `${row.incidentType} ${row.locationRaw} ${row.summary} ${row.transcriptEnglish}`.slice(0, 2000),
+    );
+    if (vector) {
+      await pool.query("UPDATE incidents SET embedding = $2::vector WHERE id = $1", [incidentId, vector]);
+    }
+  } catch {
+    /* similarity stays unavailable; relational data is already synced */
+  }
   return { incidentId, skipped: false };
 }
 
@@ -130,14 +151,18 @@ export interface StoreLike {
 }
 
 /** Sync every stored record. Continues past single-record failures. */
-export async function syncAll(pool: PoolLike, store: StoreLike): Promise<{ synced: number; skipped: number; errors: string[] }> {
+export async function syncAll(
+  pool: PoolLike,
+  store: StoreLike,
+  opts: SyncOptions = {},
+): Promise<{ synced: number; skipped: number; errors: string[] }> {
   const records = await store.getRecords({ limit: 500 });
   let synced = 0;
   let skipped = 0;
   const errors: string[] = [];
   for (const record of records) {
     try {
-      const r = await syncRecord(pool, record);
+      const r = await syncRecord(pool, record, opts);
       if (r.skipped) skipped += 1;
       else synced += 1;
     } catch (err) {

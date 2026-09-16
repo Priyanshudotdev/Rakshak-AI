@@ -363,6 +363,22 @@ export async function revokeSession(token: string): Promise<void> {
   await saveJson(SESSIONS_FILE, (await loadJson(SESSIONS_FILE)).filter((r) => r.token !== token));
 }
 
+export async function updatePasswordHash(operatorId: string, passwordHash: string): Promise<boolean> {
+  const rows = await loadJson(OPERATORS_FILE);
+  const hit = rows.find((r) => r.id === operatorId);
+  if (!hit) return false;
+  hit.password_hash = passwordHash;
+  await saveJson(OPERATORS_FILE, rows);
+  return true;
+}
+
+export async function revokeOtherSessions(operatorId: string, keepToken: string): Promise<void> {
+  await saveJson(
+    SESSIONS_FILE,
+    (await loadJson(SESSIONS_FILE)).filter((r) => !(r.operator_id === operatorId && r.token !== keepToken)),
+  );
+}
+
 /** Next dispatch id from the max existing suffix — count-based ids collide after the 200-cap trim. */
 export function nextDispatchId(log: Doc[]): string {
   let max = 0;

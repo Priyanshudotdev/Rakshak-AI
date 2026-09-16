@@ -346,6 +346,21 @@ export async function revokeSession(token: string): Promise<void> {
   await pool().query("DELETE FROM operator_sessions WHERE token = $1", [token]);
 }
 
+export async function updatePasswordHash(operatorId: string, passwordHash: string): Promise<boolean> {
+  await ensureSchema();
+  const res = await pool().query("UPDATE operators SET password_hash = $2 WHERE id = $1", [operatorId, passwordHash]);
+  return (res.rowCount ?? 0) > 0;
+}
+
+export async function revokeOtherSessions(operatorId: string, keepToken: string): Promise<void> {
+  await ensureSchema();
+  // operator_id may be TEXT or UUID depending on which migration created it.
+  await pool().query("DELETE FROM operator_sessions WHERE operator_id::text = $1 AND token <> $2", [
+    String(operatorId),
+    keepToken,
+  ]);
+}
+
 export async function getIncidentVerification(incidentKey: string): Promise<{ verification: string; reports: number; evidence: Doc[] }> {
   await ensureSchema();
   const res = await pool().query(

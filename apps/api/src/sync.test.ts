@@ -66,7 +66,7 @@ describe("buildNormalizedRows", () => {
 describe("syncRecord", () => {
   it("writes calls, transcripts, incidents, assessments and explanations", async () => {
     const { pool, queries } = fakePool();
-    const out = await syncRecord(pool, RECORD);
+    const out = await syncRecord(pool, RECORD, { embed: async () => null });
     expect(out).toEqual({ incidentId: "uuid-1", skipped: false });
     const tables = queries.map((q) => q.text);
     expect(tables.some((t) => t.includes("INSERT INTO calls"))).toBe(true);
@@ -78,6 +78,23 @@ describe("syncRecord", () => {
     const incident = queries.find((q) => q.text.includes("INSERT INTO incidents"));
     expect(incident?.params).toContain(21.1484);
     expect(incident?.params).toContain(79.084);
+  });
+
+  it("writes the embedding vector when the embedder returns one", async () => {
+    const { pool, queries } = fakePool();
+    await syncRecord(pool, RECORD, { embed: async () => "[0.1,0.2]" });
+    const vec = queries.find((q) => q.text.includes("SET embedding"));
+    expect(vec?.params).toEqual(["uuid-1", "[0.1,0.2]"]);
+  });
+
+  it("skips the vector silently when embeddings are unavailable", async () => {
+    const { pool, queries } = fakePool();
+    await syncRecord(pool, RECORD, {
+      embed: async () => {
+        throw new Error("no key");
+      },
+    });
+    expect(queries.some((q) => q.text.includes("SET embedding"))).toBe(false);
   });
 
   it("skips records without a call id", async () => {

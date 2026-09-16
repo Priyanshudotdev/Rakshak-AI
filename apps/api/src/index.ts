@@ -287,6 +287,69 @@ async function requireAuth(
   return false;
 }
 
+// Geo search (§18, Phase 6): incidents with coordinates near a point.
+// Postgres-only (PostGIS); file backend answers 400.
+app.get("/api/incidents/nearby", async (req, reply) => {
+  const { selectedPool } = await import("./db.js");
+  const pool = selectedPool();
+  if (!pool) return reply.code(400).send({ status: "error", message: "Postgres backend required for geo search" });
+  const q = req.query as { lat?: string; lon?: string; radiusKm?: string; limit?: string };
+  const lat = Number(q.lat);
+  const lon = Number(q.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return reply.code(400).send({ status: "error", message: "lat and lon are required" });
+  }
+  const radiusM = Math.max(100, Math.min(Number(q.radiusKm ?? 25) || 25, 500)) * 1000;
+  const limit = Math.max(1, Math.min(Number(q.limit ?? 20) || 20, 100));
+  try {
+    const res = await pool.query(
+      `SELECT id, call_id, incident_type, priority, verification, location_raw,
+              ST_Y(geom) AS lat, ST_X(geom) AS lon,
+              ST_Distance(geom::geography, ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography) AS distance_m
+       FROM incidents
+       WHERE geom IS NOT NULL
+         AND ST_DWithin(geom::geography, ST_SetSRID(ST_MakePoint($2, $1), 4326)::geography, $3)
+       ORDER BY distance_m ASC LIMIT $4`,
+      [lat, lon, radiusM, limit],
+    );
+    return { status: "success", data: res.rows, count: res.rows.length };
+  } catch (err) {
+    const e = serverError(err);
+    return reply.code(e.code).send(e.body);
+  }
+});
+
+// Semantic search (§18, Phase 6): pgvector cosine over incident embeddings.
+// Postgres-only; 502 when the embedding provider is unavailable.
+app.post("/api/incidents/similar", async (req, reply) => {
+  const { selectedPool } = await import("./db.js");
+  const { embedText } = await import("@rakshak/ai-engine");
+  const pool = selectedPool();
+  if (!pool) return reply.code(400).send({ status: "error", message: "Postgres backend required for similarity search" });
+  const parsed = z.object({ text: z.string().min(1).max(2000), limit: z.number().int().min(1).max(50).optional() }).safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ status: "error", message: "text is required" });
+  try {
+    const vector = await embedText(parsed.data.text);
+    if (!vector) return reply.code(502).send({ status: "error", message: "Embedding provider unavailable" });
+    const res = await pool.query(
+      `SELECT id, call_id, incident_type, priority, verification, location_raw,
+              (embedding <=> $1::vector) AS distance
+       FROM incidents
+       WHERE embedding IS NOT NULL
+       ORDER BY embedding <=> $1::vector ASC LIMIT $2`,
+      [vector, parsed.data.limit ?? 10],
+    );
+    return {
+      status: "success",
+      data: res.rows.map((r) => ({ ...r, score: 1 - Number(r.distance ?? 1) })),
+      count: res.rows.length,
+    };
+  } catch (err) {
+    const e = serverError(err);
+    return reply.code(e.code).send(e.body);
+  }
+});
+
 // One-shot backfill (§15): project stored records into the normalized +
 // PostGIS schema. Postgres-only; safe to re-run (per-call rows replaced).
 app.post("/api/admin/sync-normalized", async (req, reply) => {
@@ -357,6 +420,31 @@ app.get("/api/operators/me", async (req, reply) => {
   const op = await authenticate(store, req.headers);
   if (!op) return reply.code(401).send({ status: "error", message: "Operator sign-in required" });
   return { status: "success", data: { id: op.id, name: op.name, role: op.role } };
+});
+
+const passwordChangeSchema = z.object({
+  currentPassword: z.string().min(1).max(200),
+  newPassword: z.string().min(4).max(200),
+});
+
+app.post("/api/operators/change-password", async (req, reply) => {
+  const parsed = passwordChangeSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ status: "error", message: "current and new (min 4 chars) passwords are required" });
+  }
+  const { authenticate, verifyPassword, hashPassword } = await import("./auth.js");
+  const me = await authenticate(store, req.headers);
+  if (!me) return reply.code(401).send({ status: "error", message: "Operator sign-in required" });
+  const full = await store.findOperatorByName(String(me.name));
+  if (!full?.password_hash || !(await verifyPassword(parsed.data.currentPassword, String(full.password_hash)))) {
+    return reply.code(401).send({ status: "error", message: "Current password is incorrect" });
+  }
+  await store.updatePasswordHash(String(full.id), await hashPassword(parsed.data.newPassword));
+  const raw = (req.headers.authorization ?? "").toString();
+  const token = raw.startsWith("Bearer ") ? raw.slice(7).trim() : "";
+  await store.revokeOtherSessions(String(full.id), token);
+  await store.appendAudit({ actor: String(me.name), action: "operator.change-password", entity: "operator", entity_id: String(full.id) });
+  return { status: "success", message: "Password changed; other sessions signed out" };
 });
 
 app.post("/api/operators/logout", async (req) => {
