@@ -361,6 +361,7 @@ export class AriController {
         this.hooks.log("warn", "no inbound RTP yet", { callId, rtpPort, hint: "caller mic muted or Asterisk not streaming" });
       }
     }, 8000);
+  }
 
   /** Resolve the ARI channel behind a call id (for the reply path). */
   channelForCall(callId: string): string | null {
