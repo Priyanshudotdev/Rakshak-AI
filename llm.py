@@ -11,6 +11,7 @@ from timeouts import run_with_timeout
 
 SARVAM_TIMEOUT_SEC = 12
 GEMINI_TIMEOUT_SEC = 20
+GEMINI_HTTP_TIMEOUT_MS = 8000
 GEMINI_MODELS = ("gemini-2.5-flash", "gemini-2.0-flash")
 SARVAM_CHAT_MODEL = "sarvam-105b"
 
@@ -91,7 +92,7 @@ class LLMService:
 
             client = genai.Client(
                 api_key=self.gemini_api_key,
-                http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_SEC * 1000),
+                http_options=types.HttpOptions(timeout=GEMINI_HTTP_TIMEOUT_MS),
             )
             last_error = None
             for model in GEMINI_MODELS:

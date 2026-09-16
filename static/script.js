@@ -675,11 +675,9 @@ let cachedRecords = [];
 
 async function updateRecordsBadge() {
   try {
-    const res = await fetchJson("/api/records?limit=1");
+    const res = await fetchJson("/api/records/count");
     if (res && res.data) {
-      const all = await fetchJson("/api/records");
-      const count = all.data ? all.data.length : 0;
-      els.recordsCountBadge.textContent = count;
+      els.recordsCountBadge.textContent = res.data.count;
     }
   } catch (e) {
     // ignore
@@ -693,7 +691,7 @@ async function loadMemoryRecords() {
   try {
     const res = await fetchJson("/api/records");
     cachedRecords = res.data || [];
-    els.recordsCountBadge.textContent = cachedRecords.length;
+    updateRecordsBadge();
     filterAndRenderRecords();
   } catch (err) {
     showError("Could not load memory records.");
@@ -758,8 +756,10 @@ function renderRecordsGrid(records) {
     const ext = record.extraction || {};
     const prio = record.priority || {};
     const level = (prio.level || "MEDIUM").toLowerCase();
-    const hasOriginalAudio = Boolean(record.original_audio_base64);
-    const hasMarathiAudio = Boolean(record.translated_audio_base64);
+    const hasOriginalAudio = Boolean(record.has_original_audio ?? record.original_audio_base64);
+    const hasMarathiAudio = Boolean(record.has_translated_audio ?? record.translated_audio_base64);
+    const originalAudioUrl = `/api/records/${encodeURIComponent(record.id)}/audio?which=original`;
+    const translatedAudioUrl = `/api/records/${encodeURIComponent(record.id)}/audio?which=translated`;
 
     const card = document.createElement("article");
     card.className = `record-card prio-${level}`;
@@ -790,7 +790,7 @@ function renderRecordsGrid(records) {
               <div style="font-size:11px;color:#38bdf8;font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:4px;">
                 <i class="ph ph-waveform"></i> Original Caller Audio
               </div>
-              <audio controls preload="none" src="${record.original_audio_base64}" style="width:100%;height:30px;"></audio>
+              <audio controls preload="none" src="${escapeHtml(originalAudioUrl)}" style="width:100%;height:30px;"></audio>
             </div>
           ` : ""}
           ${hasMarathiAudio ? `
@@ -798,7 +798,7 @@ function renderRecordsGrid(records) {
               <div style="font-size:11px;color:var(--accent);font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:4px;">
                 <i class="ph ph-speaker-high"></i> Marathi Voice (${escapeHtml(record.speaker_gender || ext.caller_gender || "Voice")})
               </div>
-              <audio controls preload="none" src="${record.translated_audio_base64}" style="width:100%;height:30px;"></audio>
+              <audio controls preload="none" src="${escapeHtml(translatedAudioUrl)}" style="width:100%;height:30px;"></audio>
             </div>
           ` : ""}
         </div>
@@ -826,6 +826,10 @@ function openRecordModal(record) {
   const prio = record.priority || {};
   const level = (prio.level || "MEDIUM").toLowerCase();
   const timings = record.timings || {};
+  const modalOriginalAudioUrl = `/api/records/${encodeURIComponent(record.id)}/audio?which=original`;
+  const modalTranslatedAudioUrl = `/api/records/${encodeURIComponent(record.id)}/audio?which=translated`;
+  const hasOriginalAudio = Boolean(record.has_original_audio ?? record.original_audio_base64);
+  const hasTranslatedAudio = Boolean(record.has_translated_audio ?? record.translated_audio_base64);
 
   els.modalTitle.textContent = `${record.id} · ${prio.level || "MEDIUM"} PRIORITY`;
   els.modalSubtitle.textContent = `${record.scenario || "Incident"} · Recorded on ${record.timestamp_formatted || ""}`;
@@ -844,24 +848,24 @@ function openRecordModal(record) {
       </dl>
 
       <!-- Modal Audio Players -->
-      ${(record.original_audio_base64 || record.translated_audio_base64) ? `
+      ${(hasOriginalAudio || hasTranslatedAudio) ? `
         <div class="audio-players-grid" style="margin-bottom:16px;">
-          ${record.original_audio_base64 ? `
+          ${hasOriginalAudio ? `
             <div class="audio-player-card original-audio-card">
               <div class="audio-player-header">
                 <div class="audio-player-title"><i class="ph ph-waveform"></i> Original Caller Audio</div>
                 <span class="audio-tag">Original Recording</span>
               </div>
-              <audio controls src="${record.original_audio_base64}" style="width:100%;height:36px;"></audio>
+              <audio controls preload="none" src="${escapeHtml(modalOriginalAudioUrl)}" style="width:100%;height:36px;"></audio>
             </div>
           ` : ""}
-          ${record.translated_audio_base64 ? `
+          ${hasTranslatedAudio ? `
             <div class="audio-player-card marathi-audio-card">
               <div class="audio-player-header">
                 <div class="audio-player-title"><i class="ph ph-speaker-high"></i> Marathi Voice Broadcast</div>
                 <span class="audio-tag">Marathi (mr-IN) · ${escapeHtml(record.speaker_gender || ext.caller_gender || "Voice")}</span>
               </div>
-              <audio controls src="${record.translated_audio_base64}" style="width:100%;height:36px;"></audio>
+              <audio controls preload="none" src="${escapeHtml(modalTranslatedAudioUrl)}" style="width:100%;height:36px;"></audio>
             </div>
           ` : ""}
         </div>

@@ -71,13 +71,14 @@ def fallback_extract(original_text: str, english_text: str) -> dict:
         immediate = False
 
     female_tokens = [
-        "husband", "पती", "पति", "तिच्या", "मला मारायला", "husband beating",
-        "wife", "woman", "girl", "lady", "स्त्री", "महिला", "आई", "mother",
-        "daughter", "बहीण", "sister", "she", "her", "माझा नवरा", "नवरा"
+        "माझा पती", "माझा नवरा", "my husband", "मेरा पति", "मेरा पती",
+        "तिच्या", "woman", "girl", "lady", "स्त्री", "महिला", "आई", "mother",
+        "daughter", "बहीण", "sister",
     ]
     male_tokens = [
-        "father", "बाबा", "बाबांना", "brother", "भाऊ", "wife", "बायको",
-        "पत्नी", "man", "boy", "पुरुष", "दुकानदार", "he", "his", "him"
+        "माझी बायको", "माझी पत्नी", "my wife", "मेरी पत्नी",
+        "father", "बाबा", "बाबांना", "brother", "भाऊ", "man", "boy",
+        "पुरुष", "दुकानदार",
     ]
     caller_gender = "Unknown"
     if any(token in blob for token in female_tokens):
@@ -393,18 +394,38 @@ class RakshakPipeline:
 
         t = _now()
         priority = apply_priority_overlay(extraction, None)
+        if priority["rule_floor"] != "HIGH" and (transcript_original or transcript_english):
+            try:
+                llm_priority, _ = self.llm.assess_priority(extraction)
+                priority = apply_priority_overlay(extraction, llm_priority)
+            except Exception:
+                pass
         timings["priority_ms"] = _ms(t)
 
         # Determine gender-appropriate voice (Female: priya, Male: shubh)
         caller_gender_val = str(extraction.get("caller_gender") or "").lower()
         victim_gender_val = str((extraction.get("people_involved") or {}).get("victim", {}).get("gender") or "").lower()
         combined_blob = f"{transcript_original} {transcript_english}".lower()
-        
-        is_female = (
-            "female" in caller_gender_val
-            or "female" in victim_gender_val
-            or any(t in combined_blob for t in ["पती", "पति", "तिच्या", "husband", "woman", "wife", "स्त्री", "महिला", "मला मारायला"])
-        )
+
+        explicit_gender = caller_gender_val or victim_gender_val
+        if "female" in explicit_gender:
+            is_female = True
+        elif "male" in explicit_gender:
+            is_female = False
+        else:
+            female_hints = [
+                "माझा पती", "माझा नवरा", "my husband", "मेरा पति", "मेरा पती",
+                "तिच्या", "woman", "girl", "lady", "स्त्री", "महिला", "आई",
+                "mother", "daughter", "बहीण", "sister",
+            ]
+            male_hints = [
+                "माझी बायको", "माझी पत्नी", "my wife", "मेरी पत्नी",
+                "father", "बाबा", "बाबांना", "brother", "भाऊ", "man",
+                "boy", "पुरुष", "दुकानदार",
+            ]
+            is_female = any(t in combined_blob for t in female_hints) and not any(
+                t in combined_blob for t in male_hints
+            )
         speaker = "priya" if is_female else "shubh"
         speaker_gender = "Female" if is_female else "Male"
 

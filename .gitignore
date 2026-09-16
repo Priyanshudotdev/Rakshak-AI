@@ -14,6 +14,8 @@ uploads/
 
 # Data store (contains large base64 audio blobs)
 data/records.json
+data/records.json.corrupt
+data/dispatch_log.json
 
 # IDE
 .vscode/

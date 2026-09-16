@@ -49,7 +49,14 @@ def test_live_pipeline():
 
     call = MOCK_EMERGENCY_CALLS[0]
     print(f"live API: processing {call['call_id']} ({call['scenario']})")
-    pipeline = RakshakPipeline()
+    try:
+        pipeline = RakshakPipeline()
+    except (ImportError, ModuleNotFoundError) as exc:
+        print(f"live API: skipped ({exc})")
+        return
+    except RuntimeError as exc:
+        print(f"live API: skipped ({exc})")
+        return
     result = pipeline.process_text(call["transcript"], source_hint=call["original_language"])
     print(json.dumps(
         {

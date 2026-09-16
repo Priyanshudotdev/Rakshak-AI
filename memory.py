@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any
 
 DATA_DIR = Path(__file__).parent / "data"
 RECORDS_FILE = DATA_DIR / "records.json"
+DISPATCH_FILE = DATA_DIR / "dispatch_log.json"
 _LOCK = threading.Lock()
 
 
@@ -25,10 +27,22 @@ def _load_raw_records() -> list[dict[str, Any]]:
     _ensure_data_dir()
     try:
         with open(RECORDS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            content = f.read()
+            if not content.strip():
+                return []
+            data = json.loads(content)
             return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    except Exception as exc:
+        backup_path = RECORDS_FILE.with_name(RECORDS_FILE.name + ".corrupt")
+        try:
+            RECORDS_FILE.replace(backup_path)
+        except OSError:
+            backup_path = None
+        raise RuntimeError(
+            f"records.json is unreadable and was moved aside"
+            + (f" to {backup_path.name}" if backup_path else "")
+            + f"; refusing to overwrite existing incident data ({exc})"
+        ) from exc
 
 
 def _save_raw_records(records: list[dict[str, Any]]):
@@ -51,7 +65,7 @@ class MemoryStore:
             record_id = record_data.get("id") or record_data.get("call_id")
             if not record_id or record_id.startswith("CALL_"):
                 now_str = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-                record_id = f"REC-{now_str}-{len(records) + 1:03d}"
+                record_id = f"REC-{now_str}-{secrets.token_hex(3).upper()}"
 
             now_iso = datetime.now(timezone.utc).isoformat()
             now_time = datetime.now(timezone.utc).astimezone().strftime("%d %b %Y, %H:%M:%S")
@@ -224,6 +238,7 @@ class MemoryStore:
         total_tts_ms = 0
         tts_count = 0
         total_ms_sum = 0
+        total_count = 0
 
         for r in records:
             prio = ((r.get("priority") or {}).get("level") or "MEDIUM").upper()
@@ -270,6 +285,7 @@ class MemoryStore:
                 tts_count += 1
             if "total_ms" in timings and timings["total_ms"]:
                 total_ms_sum += timings["total_ms"]
+                total_count += 1
 
         return {
             "total_records": total_records,
@@ -290,6 +306,41 @@ class MemoryStore:
                 "translate_ms": round(total_translate_ms / translate_count) if translate_count else 0,
                 "extract_ms": round(total_extract_ms / extract_count) if extract_count else 0,
                 "tts_ms": round(total_tts_ms / tts_count) if tts_count else 0,
-                "total_ms": round(total_ms_sum / total_records) if total_records else 0,
+                "total_ms": round(total_ms_sum / total_count) if total_count else 0,
             },
         }
+
+    @staticmethod
+    def count_records() -> int:
+        with _LOCK:
+            return len(_load_raw_records())
+
+    @staticmethod
+    def get_dispatch_log() -> list[dict[str, Any]]:
+        _ensure_data_dir()
+        try:
+            with open(DISPATCH_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    @staticmethod
+    def append_dispatch_entry(entry: dict[str, Any]) -> list[dict[str, Any]]:
+        with _LOCK:
+            log = []
+            try:
+                with open(DISPATCH_FILE, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, list):
+                        log = loaded
+            except Exception:
+                log = []
+            entry["id"] = f"DSP-{len(log) + 1:03d}"
+            log.insert(0, entry)
+            log = log[:200]
+            temp_file = DISPATCH_FILE.with_suffix(".tmp")
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(log, f, indent=2, ensure_ascii=False)
+            temp_file.replace(DISPATCH_FILE)
+            return log

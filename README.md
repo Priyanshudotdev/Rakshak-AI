@@ -17,9 +17,18 @@ Python · Flask · Sarvam AI · Gemini · JavaScript
 
 ### Run Locally
 
-```bash
-git clone https://github.com/Priyanshudotdev/Rakshak-AI.git
-cd Rakshak-AI
-pip install -r requirements.txt
-python app.py
-```
+1. Copy `.env.example` to `.env` and fill in your API keys:
+
+   ```
+   SARVAM_API_KEY=your_sarvam_key      # required
+   GEMINI_API_KEY=your_gemini_key      # optional fallback for extraction
+   ```
+
+2. Install dependencies and start the server:
+
+   ```bash
+   pip install -r requirements.txt
+   python app.py
+   ```
+
+The app serves on `http://localhost:5000`. Set `FLASK_DEBUG=1` in `.env` to enable auto-reload during development.
