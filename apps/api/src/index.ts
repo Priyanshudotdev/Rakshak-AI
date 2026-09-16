@@ -272,6 +272,24 @@ function actorOf(req: { headers: Record<string, string | string[] | undefined> }
   return (actor ?? "operator").toString().slice(0, 100) || "operator";
 }
 
+// One-shot backfill (§15): project stored records into the normalized +
+// PostGIS schema. Postgres-only; safe to re-run (per-call rows replaced).
+app.post("/api/admin/sync-normalized", async (req, reply) => {
+  const { selectedPool } = await import("./db.js");
+  const { syncAll } = await import("./sync.js");
+  const pool = selectedPool();
+  if (!pool) return reply.code(400).send({ status: "error", message: "Postgres backend required for normalized sync" });
+  try {
+    const result = await syncAll(pool, store);
+    await store.appendAudit({ actor: actorOf(req), action: "admin.sync-normalized", entity: "database", detail: result });
+    return { status: "success", data: result };
+  } catch (err) {
+    log("error", "sync-normalized failed", { err: String(err) });
+    const e = serverError(err);
+    return reply.code(e.code).send(e.body);
+  }
+});
+
 app.get("/api/audit", async (req) => {
   const q = req.query as { limit?: string };
   const limit = Math.max(1, Math.min(Number(q.limit ?? 50) || 50, 500));
