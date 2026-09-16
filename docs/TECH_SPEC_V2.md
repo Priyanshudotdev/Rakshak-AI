@@ -1,0 +1,75 @@
+# Rakshak AI V2 — Technical Specification (feat/v2-architecture)
+
+Branch: `feat/v2-architecture` (all V2 work stays here; `master` frozen as Phase-1 prototype).
+Canonical context: Master AI Development Prompt §§1–31.
+
+## 1. Where we are (Phase-1 prototype, `master`)
+
+Monolithic Python/Flask on `localhost:5000`:
+
+- `app.py` — Flask REST: `/api/process-call` (text), `/api/process-audio` (batch file), `/api/records`, `/api/records/count`, `/api/records/:id/audio` (streamed, slim list by default), `/api/analytics`, `/api/tts`, `/api/dispatch`.
+- `pipeline.py` — `RakshakPipeline.process_text/process_audio`: Sarvam lang-detect → translate EN/MR → `LLMService.extract` (Gemini `gemini-2.5-flash` → `gemini-2.0-flash` → rules fallback) → rule-floor priority + LLM `assess_priority` overlay → gender-appropriate Bulbul TTS (`priya`/`shubh`, `mr-IN`).
+- `sarvam_client.py` / `llm.py` — Sarvam STT/translate/TTS + Gemini extraction/priority wrappers with timeouts (`timeouts.py`).
+- `memory.py` — JSON persistence: `data/records.json` (+`.corrupt` safeguard, no silent overwrite), `data/dispatch_log.json` (capped 200, atomic tmp+replace). Analytics with correct `total_ms` averaging.
+- `templates/dashboard.html` + `static/script.js/style.css` — 3-tab dashboard, audio via `/audio?which=` URLs, count endpoint.
+- `mock_calls.py`, `test_rakshak.py` — mock data + live-pipeline smoke test.
+
+Limits: batch-only (no partial transcripts), no telephony, no streaming WS, no Redis/queue, no Postgres/PostGIS/pgvector, no typed contracts, no audit/RBAC, no correlation/verification.
+
+## 2. Where we are going (target, per §§4–8, 22–24)
+
+```
+Caller → SIP → Asterisk (PJSIP+ARI+External Media) → Media Gateway (Node/TS/Fastify+WS)
+  → Sarvam Saaras Realtime (partial/final) → AI Engine (Node/TS) → Redis/BullMQ → WS Gateway
+  → Next.js dashboard → Operator → Translation → Sarvam Bulbul → Asterisk → Caller
+  → Postgres (PostGIS+pgvector) for incidents/transcripts/audit
+```
+
+Pillars: COMMUNICATE (STT/translation/TTS+barge-in) → UNDERSTAND (typed extraction/classification/priority+explanation) → CORRELATE (multi-source, verification).
+
+Rules enforced: TS-first backend (§24), Asterisk isolated from AI (§6), gateway has no incident logic (§7), LLM never dispatches directly (§9, §12), original transcript always preserved (§16), streaming critical path vs queued secondary path (§26), small service count (§23).
+
+## 3. Affected components for V2 scaffold (smallest coherent change)
+
+| Prototype piece | V2 owner | Change |
+|---|---|---|
+| `app.py` Flask routes | `apps/api` (Fastify+TS) | Port `/api/health`, `/process-*`, `/records`, `/analytics`, `/tts`, `/dispatch` as typed REST; add WS gateway for `transcript.partial/final`, `incident.created/updated`, `priority.updated` events (§13). Keep Flask under `legacy/` read-only for reference. |
+| `pipeline.py` + `llm.py` | `services/ai-engine` (TS orchestration) | Port as `LanguageProcessor → TranslationOrchestrator → EntityExtractor → Classifier → PriorityEngine + ExplanationEngine` with Zod-validated incident schema (§10). Sarvam/Gemini behind `ISpeechProvider` / `ILLMProvider` adapters so providers are swappable (§28). Keep Python out unless local inference justified (§24, §29). |
+| `sarvam_client.py` batch STT | `services/media-gateway` (Node/TS) | New: Asterisk External Media WS intake → session manager → Sarvam Saaras Realtime WS → partial/final emit. TTS connector with barge-in (stop on `speech.started`). No AI logic here. |
+| `memory.py` JSON files | `database/` (Postgres+PostGIS+pgvector) + Redis | Migrate entities (§15): `calls, transcripts/segments, incidents/entities/locations/sources, priority_assessments, ai_explanations, audit_logs`. Redis for call-session/ephemeral + BullMQ queues: `extraction, classification, location-resolution, incident-correlation, enrichment, notification` (§14). |
+| `templates/` + `static/` | `apps/dashboard` (Next.js+TS+Tailwind+shadcn, TanStack Query, MapLibre) | Rebuild views: active calls, live original+translated transcript, incident card, map, priority+reasons, evidence/verification, timeline, operator actions (§20). Never expose SIP/AI keys to browser (§25). |
+| `mock_calls.py` / tests | `packages/types`, `packages/events` + e2e harness | Shared TS types (`call, transcript, incident, priority, events`) consumed by api/gateway/dashboard. Event catalog versioned. |
+
+## 4. Data flow (MVP vertical first, §4)
+
+Critical (streaming, never queued): Audio → Gateway → Saaras partial → WS → dashboard (<1s target for first partial).
+Secondary (queued): Final transcript → BullMQ `extraction` → AI engine → Postgres → `incident.created/updated` → WS → dashboard; enrichment/correlation async.
+
+Two-way: Operator text → translate → Bulbul TTS → gateway → Asterisk; caller speech during TTS triggers barge-in → cancel TTS, resume STT.
+
+Uncertainty preserved: `estimate/range + confidence + source` (e.g. "maybe 2–3 people" ≠ `affected: 3`); original + translated + segments with timestamps/confidence/speaker retained.
+
+## 5. API / event / DB changes
+
+- REST (Fastify, Zod): Flask response shapes kept (`{status, data}`); live `GET /api/stream` (WS), `POST /api/events/publish` (optional `EVENT_INGEST_KEY`), `GET /api/events/recent`, `GET /api/metrics/latency` (avg/p50/p95 per §26 timing). Batch endpoints fan out `transcript.final → incident.created → priority.updated`; `POST /api/process-audio?callId=` links gateway legs to records.
+- Events (§13): in-memory bus + WS gateway today (Redis pub/sub when the worker fleet needs it); catalog in `packages/types` (`RakshakEvents`), envelope helper in `packages/events`.
+- DB: `001_core.sql` (Postgres + PostGIS + pgvector, §15 tables) for the geo/vector phase; `002_records_store.sql` (records + dispatch_log) backs the live API via `pgstore.ts`. Backend selector: Postgres when `DATABASE_URL` works, else the file store — identical semantics locked by `pgstore.test.ts` equivalence coverage (pg-mem, no Docker needed).
+- Validation: Zod on ingest routes; every LLM output JSON-parsed/validated before persist/emit; reject → rules fallback + `llm_used: rules`.
+- Tests (TDD, vitest): ai-engine (extract/priority/correlation), gateway sessions, worker (feeds/verify), api (pgstore equivalence), dashboard (verification mapper). `npm run test --workspaces --if-present`.
+
+## 6. Latency / reliability implications
+
+- Measure explicitly (§26): ingestion, STT first-partial, finalization, translation, extraction, WS delivery, TTS first-audio, e2e conversational. Add `timings` (as today) + OpenTelemetry spans; Prometheus/Grafana later.
+- Reliability (§25): per-hop timeouts/retries/circuit-breakers (reuse `timeouts.py` semantics in TS `p-timeout`/`cockatiel`); gateway reconnect/backpressure/session cleanup; non-critical enrichment failure must not kill call; rate-limit + RBAC + audit logs; secrets server-only.
+- No audio path behind BullMQ; only enrichment/correlation queued.
+
+## 7. Execution plan (phases §27, smallest-first) — status on this branch
+
+1. **Scaffold: DONE.** Monorepo §23 + shared packages + compose + `001_core.sql` + Flask prototype moved to `legacy/` (history preserved via `git mv`).
+2. **Phase 1 parity: DONE.** `apps/api` Fastify port (all legacy routes + slim audio streaming + dispatch persistence); `services/ai-engine` TS port (Sarvam/Gemini adapters, rules fallback, priority overlay); `apps/dashboard` Next.js console (intake, records, workspace, dispatch, analytics).
+3. **Phase 2 realtime backbone: DONE.** Gateway WS transport (sessions, replay mode, barge-in hook, backpressure, idle sweep) + API event bus/WS gateway + latency percentiles + dashboard live wire. Saaras Realtime adapter boundary defined, unwired.
+4. **Phase 3 Asterisk: CONFIGS DONE, live wiring pending.** `pjsip/ari/extensions` templates + nginx edge proxy; needs trunk + host to verify.
+5. **Phase 4 two-way: PARTIAL.** `tts-stop` barge-in event path exists; Bulbul injection into Asterisk audio pending on Phase 3.
+6. **Phase 5/6 aggregation: WORKER DONE, geo/vector pending.** RSS intake → six queues (direct-mode fallback) → offline-safe extraction → weighted correlation → verification ladder (operator-only confirmation). PostGIS/pgvector + dashboard correlation views are next.
+
+Each step: types → events → migration → implementation → validation → docs update; never silently alter core architecture.

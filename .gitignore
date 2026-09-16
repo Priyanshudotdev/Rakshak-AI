@@ -24,3 +24,10 @@ data/dispatch_log.json
 
 # OS
 Thumbs.db
+
+# Node / TypeScript V2
+node_modules/
+dist/
+.next/
+*.tsbuildinfo
+npm-debug.log*

@@ -1,0 +1,200 @@
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { WebSocketServer, type WebSocket } from "ws";
+import { SessionManager } from "./session.js";
+import { createAdapter } from "./saaras.js";
+
+// Media Gateway (spec §7): Asterisk media <-> Sarvam STT transport + session mgmt.
+// Replay/file mode (current): WS audio intake -> session buffer -> API batch endpoint.
+// Realtime mode (Asterisk phase): Saaras Realtime adapter streams partials.
+//
+// WS protocol (text frames are JSON, binary frames are audio chunks):
+//   {type:"start", callId?, from?, to?}   (re)start a session
+//   {type:"partial", text, language?}      relay a live partial transcript
+//   {type:"finalize", filename?}           process buffered audio via the API
+//   {type:"tts-stop"}                      barge-in: caller spoke over TTS
+//   {type:"end", reason?}                  close the call leg
+// Connect at /gateway/audio?callId=CALL_xxx (auto-starts the session).
+
+const PORT = Number(process.env.PORT ?? 3002);
+const API_URL = process.env.API_URL ?? "http://localhost:3001";
+const INGEST_KEY = process.env.EVENT_INGEST_KEY ?? "";
+const IDLE_MS = Number(process.env.SESSION_IDLE_MS ?? 60_000);
+const MAX_SESSIONS = Number(process.env.MAX_SESSIONS ?? 200);
+
+const sessions = new SessionManager(MAX_SESSIONS);
+const adapter = createAdapter();
+
+function log(level: string, msg: string, fields: Record<string, unknown> = {}): void {
+  console.log(JSON.stringify({ level, msg, at: new Date().toISOString(), ...fields }));
+}
+
+async function publish(name: string, callId: string, payload: unknown): Promise<void> {
+  try {
+    const res = await fetch(`${API_URL}/api/events/publish`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(INGEST_KEY ? { "x-ingest-key": INGEST_KEY } : {}),
+      },
+      body: JSON.stringify({ name, callId, payload }),
+    });
+    if (!res.ok) log("warn", "event publish rejected", { name, callId, status: res.status });
+  } catch (err) {
+    log("warn", "event publish failed", { name, callId, err: String(err) });
+  }
+}
+
+async function finalize(callId: string, filename?: string): Promise<void> {
+  const drained = sessions.takeAudio(callId);
+  if (!drained) return;
+  const form = new FormData();
+  form.append("file", new Blob([drained.bytes as unknown as BlobPart]), filename || "gateway.webm");
+  try {
+    const res = await fetch(`${API_URL}/api/process-audio?callId=${encodeURIComponent(callId)}`, {
+      method: "POST",
+      body: form,
+    });
+    if (!res.ok) {
+      log("warn", "process-audio rejected", { callId, status: res.status });
+      return;
+    }
+    const body = (await res.json()) as { data?: { transcript_original?: string; original_language?: string; id?: string } };
+    await publish("transcript.final", callId, {
+      original_text: body.data?.transcript_original ?? "",
+      language: body.data?.original_language ?? "Unknown",
+      record_id: body.data?.id,
+    });
+  } catch (err) {
+    log("warn", "finalize failed", { callId, err: String(err) });
+  }
+}
+
+const http = createServer((req: IncomingMessage, res: ServerResponse) => {
+  if (req.url?.startsWith("/health")) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ok", service: "media-gateway", mode: "replay", sessions: sessions.size }));
+    return;
+  }
+  res.writeHead(404);
+  res.end();
+});
+
+const wss = new WebSocketServer({ server: http, path: "/gateway/audio" });
+
+wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
+  const url = new URL(req.url ?? "/", "http://localhost");
+  const queryId = url.searchParams.get("callId") ?? `CALL-${Date.now().toString(36).toUpperCase()}`;
+  let callId = queryId;
+  const marker = ws as unknown as { isAlive?: boolean };
+  marker.isAlive = true;
+  ws.on("pong", () => {
+    marker.isAlive = true;
+  });
+
+  try {
+    sessions.start(callId);
+  } catch {
+    ws.close(1008, "gateway at capacity");
+    return;
+  }
+  void publish("call.started", callId, { via: "gateway", mode: "replay" });
+  // Keep one realtime adapter session per call leg for the Asterisk phase.
+  void adapter.connect(callId, {
+    onPartial: (text, language) => {
+      void publish("transcript.partial", callId, { original_text: text, language: language ?? "Unknown" });
+    },
+    onFinal: (text, language) => {
+      void publish("transcript.final", callId, { original_text: text, language: language ?? "Unknown" });
+    },
+    onError: (err) => log("warn", "realtime error", { callId, err: String(err) }),
+    onClose: () => undefined,
+  }).catch((err) => log("warn", "realtime connect failed", { callId, err: String(err) }));
+
+  ws.on("message", (data, isBinary) => {
+    if (isBinary) {
+      const ok = sessions.pushAudio(callId, data as Buffer);
+      if (!ok) {
+        void publish("call.ended", callId, { reason: "buffer-overflow" });
+        ws.close(1009, "session buffer full");
+      }
+      return;
+    }
+    let frame: { type?: string; [k: string]: unknown };
+    try {
+      frame = JSON.parse(String(data)) as typeof frame;
+    } catch {
+      return;
+    }
+    switch (frame.type) {
+      case "start": {
+        const id = typeof frame.callId === "string" && frame.callId ? frame.callId : callId;
+        try {
+          sessions.start(id, frame.from as string | undefined, frame.to as string | undefined);
+        } catch {
+          ws.close(1008, "gateway at capacity");
+          return;
+        }
+        callId = id;
+        void publish("call.answered", callId, {});
+        break;
+      }
+      case "partial": {
+        if (typeof frame.text === "string" && frame.text) {
+          sessions.markPartial(callId);
+          void publish("transcript.partial", callId, {
+            original_text: frame.text,
+            language: (frame.language as string | undefined) ?? "Unknown",
+          });
+        }
+        break;
+      }
+      case "finalize": {
+        sessions.touch(callId);
+        void finalize(callId, frame.filename as string | undefined);
+        break;
+      }
+      case "tts-stop": {
+        // Barge-in: caller spoke while TTS was playing — stop outgoing audio.
+        if (sessions.stopTts(callId)) void publish("speech.started", callId, { barge_in: true });
+        break;
+      }
+      case "end": {
+        const ended = sessions.end(callId);
+        if (ended) void publish("call.ended", callId, { reason: (frame.reason as string | undefined) ?? "client-hangup" });
+        ws.close(1000, "bye");
+        break;
+      }
+      default:
+        break;
+    }
+  });
+
+  ws.on("close", () => {
+    const ended = sessions.end(callId);
+    if (ended) void publish("call.ended", callId, { reason: "transport-close" });
+  });
+});
+
+setInterval(() => {
+  for (const client of wss.clients) {
+    const marker = client as unknown as { isAlive?: boolean };
+    if (marker.isAlive === false) {
+      client.terminate();
+      continue;
+    }
+    marker.isAlive = false;
+    client.ping();
+  }
+}, 30_000);
+
+setInterval(() => {
+  const idle = sessions.sweepIdle(IDLE_MS);
+  for (const session of idle) {
+    void publish("call.ended", session.callId, { reason: "idle-timeout" });
+  }
+  if (idle.length) log("info", "swept idle sessions", { count: idle.length });
+}, 15_000);
+
+http.listen(PORT, () => {
+  log("info", `media-gateway listening on :${PORT}`, { mode: "replay", api: API_URL });
+});

@@ -1,0 +1,105 @@
+name: rakshak-ai-v2
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: rakshak
+      POSTGRES_PASSWORD: rakshak
+      POSTGRES_DB: rakshak
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rakshak"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.api
+    environment:
+      DATABASE_URL: postgres://rakshak:rakshak@postgres:5432/rakshak
+      EVENT_INGEST_KEY: ${EVENT_INGEST_KEY:-}
+      SARVAM_API_KEY: ${SARVAM_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      PORT: 3001
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  media-gateway:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.gateway
+    environment:
+      API_URL: http://api:3001
+      EVENT_INGEST_KEY: ${EVENT_INGEST_KEY:-}
+      PORT: 3002
+      SARVAM_API_KEY: ${SARVAM_API_KEY:-}
+    ports:
+      - "3002:3002"
+    depends_on:
+      api:
+        condition: service_started
+
+  ingestion-worker:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.worker
+    environment:
+      API_URL: http://api:3001
+      REDIS_URL: redis://redis:6379
+      EVENT_INGEST_KEY: ${EVENT_INGEST_KEY:-}
+      RSS_FEEDS: ${RSS_FEEDS:-}
+      POLL_MS: ${POLL_MS:-300000}
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.dashboard
+      args:
+        # URL browsers use to reach the API (baked in at build time).
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001}
+    environment:
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_started
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "80:80"
+    depends_on:
+      - dashboard
+      - api
+      - media-gateway
+
+volumes:
+  pgdata:

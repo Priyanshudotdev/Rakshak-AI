@@ -1,0 +1,150 @@
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { beforeEach, describe, expect, it } from "vitest";
+import { newDb } from "pg-mem";
+import { injectPool, type PoolLike } from "./db.js";
+
+// File store reads DATA_DIR at import time — point it at a sandbox first.
+process.env.DATA_DIR = mkdtempSync(join(tmpdir(), "rakshak-file-"));
+const file = await import("./store.js");
+const pgstore = await import("./pgstore.js");
+const { computeAnalytics } = await import("./analytics.js");
+
+const MIGRATION = readFileSync(
+  fileURLToPath(new URL("../../../database/migrations/002_records_store.sql", import.meta.url)),
+  "utf-8",
+);
+
+let pool: PoolLike;
+
+beforeEach(async () => {
+  const db = newDb();
+  await db.public.query(MIGRATION);
+  const { Pool } = db.adapters.createPg();
+  pool = new Pool() as unknown as PoolLike;
+  injectPool(pool);
+  await file.clearAll();
+});
+
+function seedInput(overrides: Record<string, unknown> = {}) {
+  return {
+    call_id: "CALL-1",
+    scenario: "Test",
+    source: "text",
+    original_language: "Hindi",
+    transcript_original: "Sadar me chori",
+    transcript_english: "Theft in Sadar",
+    extraction: { incident_type: "Theft", location: "Sadar", weapon_mentioned: false },
+    priority: { level: "MEDIUM" },
+    timings: { total_ms: 100 },
+    ...overrides,
+  };
+}
+
+describe("pgstore (Postgres backend)", () => {
+  it("round-trips a record with audio and timings intact", async () => {
+    const saved = await pgstore.saveRecord(
+      seedInput({ original_audio_base64: "data:audio/wav;base64,AAA", timings: { speech_ms: 50, total_ms: 200 } }),
+    );
+    // call_id without the CALL_ prefix is kept as the record id (file-store parity).
+    expect(saved.id).toBe("CALL-1");
+    const got = await pgstore.getRecord(saved.id);
+    expect(got?.original_audio_base64).toBe("data:audio/wav;base64,AAA");
+    expect(got?.timings).toEqual({ speech_ms: 50, total_ms: 200 });
+  });
+
+  it("finds records by call_id as well as id", async () => {
+    const saved = await pgstore.saveRecord(seedInput({ call_id: "CALL-XYZ" }));
+    expect((await pgstore.getRecord("CALL-XYZ"))?.id).toBe(saved.id);
+    expect(await pgstore.getRecord("NOPE")).toBeNull();
+  });
+
+  it("replaces on duplicate transcript instead of duplicating", async () => {
+    const first = await pgstore.saveRecord(seedInput({ transcript_original: "same words" }));
+    const second = await pgstore.saveRecord(seedInput({ transcript_original: "same words" }));
+    expect(second.id).toBe(first.id);
+    expect(await pgstore.countRecords()).toBe(1);
+  });
+
+  it("filters by text, priority and language with limit/offset", async () => {
+    await pgstore.saveRecord(seedInput({ call_id: "A", transcript_original: "fire in sitabuldi", priority: { level: "HIGH" }, original_language: "Marathi" }));
+    await pgstore.saveRecord(seedInput({ call_id: "B", transcript_original: "theft in sadar", priority: { level: "LOW" }, original_language: "Hindi" }));
+    expect((await pgstore.getRecords({ q: "sitabuldi" })).map((r) => r.call_id)).toEqual(["A"]);
+    expect((await pgstore.getRecords({ priority: "LOW" })).map((r) => r.call_id)).toEqual(["B"]);
+    expect((await pgstore.getRecords({ language: "marathi" })).map((r) => r.call_id)).toEqual(["A"]);
+    expect(await pgstore.getRecords({ limit: 1, offset: 1 })).toHaveLength(1);
+  });
+
+  it("deletes by id or call_id and reports accurately", async () => {
+    await pgstore.saveRecord(seedInput({ call_id: "GONE" }));
+    expect(await pgstore.deleteRecord("NOPE")).toBe(false);
+    expect(await pgstore.deleteRecord("GONE")).toBe(true);
+    expect(await pgstore.countRecords()).toBe(0);
+  });
+
+  it("clears all and counts", async () => {
+    await pgstore.saveRecord(seedInput({ call_id: "A" }));
+    await pgstore.saveRecord(seedInput({ call_id: "B", transcript_original: "different words" }));
+    expect(await pgstore.countRecords()).toBe(2);
+    expect(await pgstore.clearAll()).toBe(2);
+    expect(await pgstore.countRecords()).toBe(0);
+  });
+
+  it(
+    "numbers dispatch entries and caps the log at 200",
+    async () => {
+      for (let i = 0; i < 205; i++) {
+        await pgstore.appendDispatchEntry({ call_id: `C-${i}` });
+      }
+      const log = await pgstore.getDispatchLog();
+      expect(log).toHaveLength(200);
+      expect(log[0].id).toBe("DSP-205");
+      // Post-cap appends must keep unique, monotonic ids (no count-based reuse).
+      await pgstore.appendDispatchEntry({ call_id: "C-206" });
+      await pgstore.appendDispatchEntry({ call_id: "C-207" });
+      const again = await pgstore.getDispatchLog();
+      expect(again).toHaveLength(200);
+      expect(again[0].id).toBe("DSP-207");
+      expect(new Set(again.map((e) => e.id)).size).toBe(200);
+    },
+    // 207 sequential pg-mem round-trips; marginal on loaded machines.
+    90_000,
+  );
+
+  it("stamps the returned entry with its dispatch id (file-store parity)", async () => {
+    const entry: Record<string, unknown> = { call_id: "E-1" };
+    await pgstore.appendDispatchEntry(entry);
+    expect(entry.id).toMatch(/^DSP-/);
+  });
+
+  it("marks dispatch on the matching record", async () => {
+    await pgstore.saveRecord(seedInput({ call_id: "D-1" }));
+    expect(await pgstore.updateRecordDispatch("D-1", { id: "DSP-001" })).toBe(true);
+    expect(await pgstore.updateRecordDispatch("GHOST", {})).toBe(false);
+    const rec = await pgstore.getRecord("D-1");
+    expect(rec?.dispatched).toBe(true);
+    expect(rec?.dispatch_info).toEqual({ id: "DSP-001" });
+  });
+
+  it("computes analytics identical to the file store on the same data", async () => {
+    const inputs = [
+      seedInput({ call_id: "H", priority: { level: "HIGH" }, extraction: { incident_type: "Fire", location: "Sadar", weapon_mentioned: true, weapon_type: "knife", immediate_danger: true, caller_state: "panicked" }, timings: { speech_ms: 100, total_ms: 500 } }),
+      seedInput({ call_id: "M", transcript_original: "other words", priority: { level: "MEDIUM" }, extraction: { incident_type: "Theft", location: "Sadar", weapon_mentioned: false, immediate_danger: false, caller_state: "calm" }, timings: { total_ms: 300 } }),
+      seedInput({ call_id: "L", transcript_original: "third words", priority: { level: "LOW" }, extraction: { incident_type: "Unknown", location: "Not identified", weapon_mentioned: false, immediate_danger: false, caller_state: "unknown" }, timings: {} }),
+    ];
+    for (const input of inputs) {
+      await file.saveRecord(structuredClone(input));
+      await pgstore.saveRecord(structuredClone(input));
+    }
+    const [a, b] = [await file.getAnalytics(), await pgstore.getAnalytics()];
+    expect(b).toEqual(a);
+    expect(b.total_records).toBe(3);
+    expect(b.priority_breakdown).toMatchObject({ HIGH: 1, MEDIUM: 1, LOW: 1 });
+    expect(b.weapon_stats.present).toBe(1);
+    expect(b.immediate_danger_count).toBe(1);
+    expect(b.average_latencies.total_ms).toBe(400);
+    expect(computeAnalytics(await pgstore.getRecords({ limit: 500 }))).toEqual(b);
+  });
+});

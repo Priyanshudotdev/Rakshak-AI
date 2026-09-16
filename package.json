@@ -1,0 +1,20 @@
+{
+  "name": "rakshak-ai",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Rakshak AI — real-time emergency communication and incident-intelligence platform (V2 TypeScript-first monorepo)",
+  "workspaces": [
+    "apps/*",
+    "services/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.base.json",
+    "build": "npm run build --workspaces --if-present",
+    "dev:api": "npm run dev --workspace apps/api",
+    "dev:gateway": "npm run dev --workspace services/media-gateway"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,19 @@
+# Keep the build context lean: deps install from manifests, sources copy after.
+node_modules/
+npm-debug.log*
+.git/
+.gitignore
+rakshak_env/
+__pycache__/
+*.pyc
+data/
+.env
+.env.local
+apps/*/dist/
+apps/*/.next/
+services/*/dist/
+packages/*/dist/
+C:\Users\priya\AppData\Local\Temp\
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,43 @@
+# Ingestion-worker image: RSS intake → queues → correlation → verification.
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json tsconfig.base.json ./
+COPY services/ingestion-worker/package.json ./services/ingestion-worker/
+COPY services/ai-engine/package.json ./services/ai-engine/
+COPY packages/types/package.json ./packages/types/
+COPY packages/events/package.json ./packages/events/
+COPY packages/config/package.json ./packages/config/
+COPY packages/logger/package.json ./packages/logger/
+COPY packages/types/tsconfig.json ./packages/types/
+COPY packages/events/tsconfig.json ./packages/events/
+COPY packages/config/tsconfig.json ./packages/config/
+COPY packages/logger/tsconfig.json ./packages/logger/
+COPY services/ai-engine/tsconfig.json ./services/ai-engine/
+COPY services/ingestion-worker/tsconfig.json ./services/ingestion-worker/
+RUN npm ci --no-audit --no-fund
+
+FROM deps AS build
+COPY packages/types/src ./packages/types/src
+COPY packages/events/src ./packages/events/src
+COPY packages/config/src ./packages/config/src
+COPY packages/logger/src ./packages/logger/src
+COPY services/ai-engine/src ./services/ai-engine/src
+COPY services/ingestion-worker/src ./services/ingestion-worker/src
+RUN npm run build --workspace @rakshak/types \
+ && npm run build --workspace @rakshak/config \
+ && npm run build --workspace @rakshak/logger \
+ && npm run build --workspace @rakshak/events \
+ && npm run build --workspace @rakshak/ai-engine \
+ && npm run build --workspace @rakshak/ingestion-worker
+
+FROM node:20-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps /app/package.json ./package.json
+COPY --from=build /app/services/ingestion-worker/dist ./services/ingestion-worker/dist
+COPY --from=build /app/services/ingestion-worker/package.json ./services/ingestion-worker/package.json
+COPY --from=build /app/services/ai-engine/dist ./services/ai-engine/dist
+COPY --from=build /app/services/ai-engine/package.json ./services/ai-engine/package.json
+COPY --from=build /app/packages ./packages
+CMD ["node", "services/ingestion-worker/dist/index.js"]
