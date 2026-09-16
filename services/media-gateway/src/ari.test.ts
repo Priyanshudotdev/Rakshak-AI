@@ -147,7 +147,9 @@ describe("AriController", () => {
     await new Promise((r) => setTimeout(r, 50));
     // Exactly one external fork despite three StasisStart events.
     expect(ctx.calls.filter((c) => c.url.includes("externalMedia"))).toHaveLength(1);
-    expect(ctx.calls.filter((c) => c.url.includes("bridges") && c.method === "POST")).toHaveLength(1);
+    expect(
+      ctx.calls.filter((c) => c.method === "POST" && c.url.split("?")[0].endsWith("/bridges")),
+    ).toHaveLength(1);
   });
 
   it("survives malformed frames and failed REST calls", async () => {
