@@ -58,17 +58,43 @@ export function resampleLinear16(samples: Int16Array, fromRate: number, toRate: 
   return out;
 }
 
-/** Parse a WAV header; returns PCM16 mono info or null. */
-export function parseWavHeader(wav: Buffer): { dataOffset: number; sampleRate: number; channels: number; bits: number } | null {
+/** Parse a WAV header by walking subchunks to the `data` chunk. Never assumes
+ *  44 bytes: synths often emit JUNK/LIST/fact chunks that shift the audio,
+ *  and every shifted byte plays as static. Returns PCM info or null. */
+export function parseWavHeader(wav: Buffer): {
+  dataOffset: number;
+  dataLength: number;
+  sampleRate: number;
+  channels: number;
+  bits: number;
+} | null {
   try {
-    if (wav.length < 44 || wav.subarray(0, 4).toString() !== "RIFF") return null;
+    if (wav.length < 16 || wav.subarray(0, 4).toString() !== "RIFF") return null;
     const view = new DataView(wav.buffer, wav.byteOffset, wav.byteLength);
-    return {
-      dataOffset: 44,
-      sampleRate: view.getUint32(24, true),
-      channels: view.getUint16(22, true),
-      bits: view.getUint16(34, true),
-    };
+    if (wav.subarray(8, 12).toString() !== "WAVE") return null;
+    let sampleRate = 0;
+    let channels = 0;
+    let bits = 0;
+    let offset = 12;
+    let dataOffset = -1;
+    let dataLength = 0;
+    while (offset + 8 <= wav.length) {
+      const id = wav.subarray(offset, offset + 4).toString();
+      const size = view.getUint32(offset + 4, true);
+      if (id === "fmt " && size >= 16 && offset + 24 <= wav.length) {
+        channels = view.getUint16(offset + 10, true);
+        sampleRate = view.getUint32(offset + 12, true);
+        bits = view.getUint16(offset + 22, true);
+      } else if (id === "data") {
+        dataOffset = offset + 8;
+        dataLength = size;
+        break;
+      }
+      offset += 8 + size + (size % 2);
+      if (offset > wav.length) break;
+    }
+    if (dataOffset < 0 || !sampleRate || !channels || !bits) return null;
+    return { dataOffset, dataLength, sampleRate, channels, bits };
   } catch {
     return null;
   }

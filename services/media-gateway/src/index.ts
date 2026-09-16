@@ -242,8 +242,17 @@ async function speak(channelId: string, text: string): Promise<void> {
   const wav = Buffer.from(b64, "base64");
   const { parseWavHeader, resampleLinear16 } = await import("./ari.js");
   const info = parseWavHeader(wav);
-  if (!info || info.channels !== 1 || info.bits !== 16) return;
-  const pcm = new Int16Array(wav.buffer, wav.byteOffset + info.dataOffset, (wav.length - info.dataOffset) / 2);
+  if (!info || info.channels !== 1 || info.bits !== 16) {
+    log("warn", "tts wav not mono16, skipping reply", { info });
+    return;
+  }
+  log("info", "tts reply parsed", {
+    sampleRate: info.sampleRate,
+    dataOffset: info.dataOffset,
+    dataLength: info.dataLength,
+  });
+  const sampleCount = Math.min(info.dataLength, wav.length - info.dataOffset) / 2;
+  const pcm = new Int16Array(wav.buffer, wav.byteOffset + info.dataOffset, Math.floor(sampleCount));
   await ari.sendCallAudio(channelId, resampleLinear16(pcm, info.sampleRate, 16000));
 }
 

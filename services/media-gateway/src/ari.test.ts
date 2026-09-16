@@ -55,14 +55,45 @@ describe("tts helpers", () => {
     expect(resampleLinear16(new Int16Array([5]), 16000, 16000)).toEqual(new Int16Array([5]));
   });
 
+  function wavWithJunk(): Buffer {
+    const parts: Buffer[] = [Buffer.from("RIFF....WAVE")] as Buffer[];
+    const head = parts[0];
+    head.writeUInt32LE(60, 4);
+    const junk = Buffer.alloc(8 + 10);
+    junk.write("JUNK", 0);
+    junk.writeUInt32LE(10, 4);
+    const fmt = Buffer.alloc(8 + 16);
+    fmt.write("fmt ", 0);
+    fmt.writeUInt32LE(16, 4);
+    fmt.writeUInt16LE(1, 10);
+    fmt.writeUInt32LE(22050, 12);
+    fmt.writeUInt16LE(1, 8 + 10);
+    fmt.writeUInt16LE(16, 8 + 22 - 8);
+    const data = Buffer.alloc(8 + 4);
+    data.write("data", 0);
+    data.writeUInt32LE(4, 4);
+    return Buffer.concat([head, junk, fmt, data]);
+  }
+
   it("parses wav headers and rejects junk", () => {
     const wav = Buffer.alloc(48);
     wav.write("RIFF", 0);
+    wav.write("WAVE", 8);
+    wav.write("fmt ", 12);
+    wav.writeUInt32LE(16, 16);
     wav.writeUInt16LE(1, 22);
     wav.writeUInt32LE(22050, 24);
     wav.writeUInt16LE(16, 34);
+    wav.write("data", 36);
+    wav.writeUInt32LE(4, 40);
     expect(parseWavHeader(wav)).toMatchObject({ dataOffset: 44, sampleRate: 22050, channels: 1, bits: 16 });
     expect(parseWavHeader(Buffer.from("junk"))).toBeNull();
+  });
+
+  it("finds the data chunk past JUNK sections", () => {
+    // head(12) + junk(18) + fmt(24) = data header at 54, samples at 62.
+    const parsed = parseWavHeader(wavWithJunk());
+    expect(parsed).toMatchObject({ dataOffset: 62, sampleRate: 22050, channels: 1, bits: 16, dataLength: 4 });
   });
 });
 
