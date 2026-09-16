@@ -353,7 +353,14 @@ export class AriController {
       rxBytes: 0,
     });
     this.hooks.log("info", "ari leg bridged", { callId, exten });
-  }
+    // Audible-silence watchdog: if Asterisk never streams, say so plainly
+    // instead of failing mute.
+    setTimeout(() => {
+      const leg = this.legs.get(channelId);
+      if (leg && leg.rxPackets === 0) {
+        this.hooks.log("warn", "no inbound RTP yet", { callId, rtpPort, hint: "caller mic muted or Asterisk not streaming" });
+      }
+    }, 8000);
 
   /** Resolve the ARI channel behind a call id (for the reply path). */
   channelForCall(callId: string): string | null {
@@ -438,8 +445,8 @@ export class AriController {
     ] as const) {
       try {
         await this.rest(method, path);
-      } catch {
-        /* already gone */
+      } catch (err) {
+        this.hooks.log("warn", "teardown step failed", { callId: leg.callId, method, path, err: String(err) });
       }
     }
     this.hooks.publish("call.ended", leg.callId, { reason: "ari-hangup" });
