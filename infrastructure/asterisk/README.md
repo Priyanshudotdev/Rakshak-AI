@@ -29,7 +29,8 @@ decides incidents, priorities or dispatches.
 
 ## Two real phones, same WiFi (free, no provider)
 
-On the Asterisk host PC, find its WiFi IP (here: `10.238.252.229`).
+On the Asterisk host PC, find its CURRENT WiFi IP (here: `192.168.1.52` —
+check often, DHCP changes break everything silently):
 
 | Linphone field | Phone 1 | Phone 2 |
 |---|---|---|
