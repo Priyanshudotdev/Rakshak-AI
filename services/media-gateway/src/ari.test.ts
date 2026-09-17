@@ -1,3 +1,6 @@
+import { mkdtemp, readdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { AriController, parseWavHeader, resampleLinear16, rtpPayload, type SocketLike } from "./ari.js";
 import type { RealtimeAdapter } from "./saaras.js";
@@ -98,7 +101,7 @@ describe("tts helpers", () => {
 });
 
 describe("AriController", () => {
-  function setup() {
+  function setup(extraOpts: Record<string, unknown> = {}, extraHooks: Record<string, unknown> = {}) {
     const calls: Array<{ method: string; url: string; body: unknown }> = [];
     const fetchFn = vi.fn(async (url: string, init: { method?: string; body?: string }) => {
       const body = init.body ? JSON.parse(init.body as string) : undefined;
@@ -122,6 +125,7 @@ describe("AriController", () => {
         adapter,
         publish: (name, callId) => void published.push({ name, callId }),
         log: () => undefined,
+        ...extraHooks,
       },
       {
         baseUrl: "http://asterisk:8088",
@@ -133,6 +137,7 @@ describe("AriController", () => {
           return socket;
         },
         fetchFn: fetchFn as unknown as typeof fetch,
+        ...extraOpts,
       },
     );
     return { controller, calls, sentAudio, published, socket: () => socket as unknown as FakeSocket };
@@ -222,6 +227,29 @@ describe("AriController", () => {
     const two = new Int16Array(320).fill(200);
     await Promise.all([ctx.controller.sendCallAudio(channelId, one), ctx.controller.sendCallAudio(channelId, two)]);
     expect(ctx.controller.channelForCall("unknown")).toBeNull();
+  });
+
+  it("plays replies via Asterisk file playback on the caller channel", async () => {
+    const tmp = await mkdtemp(join(tmpdir(), "tts-"));
+    const wav = Buffer.from("RIFF....WAVEfakepcm");
+    const ctx = setup(
+      { ttsDir: tmp },
+      { synthesize: async () => wav },
+    );
+    const channelId = await startCall(ctx);
+    await ctx.controller.playReply(channelId, "madat pathvat aahe");
+    const play = ctx.calls.find((c) => c.url.includes("/play"));
+    expect(play?.method).toBe("POST");
+    expect(String(play?.url)).toContain(`channels/${channelId}/play`);
+    const media = (play?.body as { media?: string })?.media ?? "";
+    expect(media.startsWith("sound:tts/tts-")).toBe(true);
+    const files = await readdir(tmp);
+    expect(files.some((f) => f.startsWith("tts-") && f.endsWith(".wav"))).toBe(true);
+    // Unknown channels and missing synthesizer are silent no-ops.
+    await ctx.controller.playReply("ghost", "hi");
+    const ctx2 = setup();
+    await startCall(ctx2);
+    await ctx2.controller.playReply("chan-abc-12345678", "hi");
   });
 
   it("survives malformed frames and failed REST calls", async () => {

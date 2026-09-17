@@ -228,43 +228,41 @@ async function handleFinal(callId: string, text: string, language?: string): Pro
   }
 }
 
+async function synthesizeSpeech(text: string): Promise<Buffer | null> {
+  try {
+    const res = await fetch(`${API_URL}/api/tts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, language_code: "mr-IN" }),
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { data?: { audio_base64?: string } };
+    const b64 = (body.data?.audio_base64 ?? "").split(",", 2)[1] ?? "";
+    if (!b64) return null;
+    return Buffer.from(b64, "base64");
+  } catch {
+    return null;
+  }
+}
+
 async function speak(channelId: string, text: string): Promise<void> {
   if (!ari) return;
-  const res = await fetch(`${API_URL}/api/tts`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, language_code: "mr-IN" }),
-  });
-  if (!res.ok) return;
-  const body = (await res.json()) as { data?: { audio_base64?: string } };
-  const b64 = (body.data?.audio_base64 ?? "").split(",", 2)[1] ?? "";
-  if (!b64) return;
-  const wav = Buffer.from(b64, "base64");
-  const { parseWavHeader, resampleLinear16 } = await import("./ari.js");
-  const info = parseWavHeader(wav);
-  if (!info || info.channels !== 1 || info.bits !== 16) {
-    log("warn", "tts wav not mono16, skipping reply", { info });
-    return;
-  }
-  log("info", "tts reply parsed", {
-    sampleRate: info.sampleRate,
-    dataOffset: info.dataOffset,
-    dataLength: info.dataLength,
-  });
-  const sampleCount = Math.min(info.dataLength, wav.length - info.dataOffset) / 2;
-  const pcm = new Int16Array(wav.buffer, wav.byteOffset + info.dataOffset, Math.floor(sampleCount));
-  await ari.sendCallAudio(channelId, resampleLinear16(pcm, info.sampleRate, 16000));
+  await ari.playReply(channelId, text);
 }
 
 if (adapter.kind === "saaras-realtime") {
-  ari = new AriController({
-    publish,
-    log,
-    adapter,
-    onFinalTranscript: (callId, text, language) => {
-      void handleFinal(callId, text, language);
+  ari = new AriController(
+    {
+      publish,
+      log,
+      adapter,
+      synthesize: synthesizeSpeech,
+      onFinalTranscript: (callId, text, language) => {
+        void handleFinal(callId, text, language);
+      },
     },
-  });
+    {},
+  );
   ari.start().catch((err) => log("warn", "ari controller failed", { err: String(err) }));
 }
 

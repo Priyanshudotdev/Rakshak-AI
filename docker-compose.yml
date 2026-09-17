@@ -61,6 +61,10 @@ services:
       ARI_USER: rakshak-gateway
       ARI_PASSWORD: rakshak-ari-test-only
       GATEWAY_RTP_HOST: media-gateway
+      # Same volume Asterisk reads as sounds/tts: replies play natively.
+      TTS_FILE_DIR: /tts-out
+    volumes:
+      - tts_sounds:/tts-out
     ports:
       - "3002:3002"
     depends_on:
@@ -118,6 +122,8 @@ services:
       - ./infrastructure/asterisk/ari.conf:/etc/asterisk/ari.conf:ro
       - ./infrastructure/asterisk/http.conf:/etc/asterisk/http.conf:ro
       - ./infrastructure/asterisk/rtp.conf:/etc/asterisk/rtp.conf:ro
+      # Shared with the gateway: TTS wavs land here, ARI plays sound:tts/<name>.
+      - tts_sounds:/var/lib/asterisk/sounds/tts
     depends_on:
       - media-gateway
 
@@ -134,3 +140,4 @@ services:
 
 volumes:
   pgdata:
+  tts_sounds:

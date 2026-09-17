@@ -1,4 +1,6 @@
 import { createSocket, type Socket as UdpSocket } from "node:dgram";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import type { RealtimeAdapter, RealtimeSession } from "./saaras.js";
 
 // ARI call control (spec §6): answer Stasis calls, fork caller audio to the
@@ -16,6 +18,8 @@ export interface AriOptions {
   rtpHost?: string;
   /** First UDP port for per-call RTP; +1 per concurrent call. */
   rtpPortBase?: number;
+  /** Shared sounds dir (same volume as Asterisk's sounds/tts). */
+  ttsDir?: string;
   createSocket?: (url: string) => SocketLike;
   fetchFn?: typeof fetch;
 }
@@ -32,6 +36,8 @@ export interface AriHooks {
   adapter: RealtimeAdapter;
   /** Full-loop handler: incident extraction + spoken reply for final transcripts. */
   onFinalTranscript?: (callId: string, text: string, language?: string) => void;
+  /** Synthesize Marathi speech. Returns the complete wav bytes (or null). */
+  synthesize?: (text: string) => Promise<Buffer | null>;
 }
 
 interface RtpPeer {
@@ -150,6 +156,7 @@ export class AriController {
       password: opts.password ?? process.env.ARI_PASSWORD ?? "rakshak-ari-test-only",
       rtpHost: opts.rtpHost ?? process.env.GATEWAY_RTP_HOST ?? "media-gateway",
       rtpPortBase: opts.rtpPortBase ?? Number(process.env.GATEWAY_RTP_BASE ?? 17777),
+      ttsDir: opts.ttsDir ?? process.env.TTS_FILE_DIR ?? "/tts-out",
       createSocket: opts.createSocket,
       fetchFn: opts.fetchFn,
     };
@@ -179,11 +186,23 @@ export class AriController {
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private reconnectDelay = 3000;
 
-  /** Connect (and stay connected with backoff). Resolves on first open. */
+  /** Connect with backoff until the first open (Asterisk may still boot),
+   *  then stay connected. Resolves only once online. */
   async start(): Promise<void> {
     this.stopped = false;
     this.reconnectDelay = 3000;
-    await this.connectOnce();
+    for (;;) {
+      try {
+        await this.connectOnce();
+        break;
+      } catch (err) {
+        if (this.stopped) return;
+        this.hooks.log("warn", "ari connect failed, retrying", { err: String(err) });
+        await new Promise((r) => setTimeout(r, this.reconnectDelay));
+        this.reconnectDelay = Math.min(this.reconnectDelay * 2, 30_000);
+      }
+    }
+    this.reconnectDelay = 3000;
     this.armReconnect();
   }
 
@@ -380,6 +399,60 @@ export class AriController {
   }
 
   private readonly sendQueues = new Map<string, Promise<void>>();
+
+  /** Speak text into the call via Asterisk's own playback (reliable path).
+   *  Writes the wav to the shared sounds volume and plays it on the CALLER
+   *  channel — no hand-built RTP involved. Serialized per channel. */
+  async playReply(channelId: string, text: string): Promise<void> {
+    const leg = this.legs.get(channelId);
+    if (!leg || !this.hooks.synthesize) return;
+    const prev = this.sendQueues.get(channelId) ?? Promise.resolve();
+    const next = prev
+      .then(async () => {
+        if (!this.legs.has(channelId)) return;
+        const wav = await this.hooks.synthesize!(text);
+        if (!wav || !this.legs.has(channelId)) return;
+        const name = `tts-${leg.callId}-${Date.now().toString(36)}`;
+        await mkdir(dirname(this.ttsPath(name)), { recursive: true });
+        await writeFile(this.ttsPath(name), wav);
+        try {
+          await this.rest("POST", `channels/${encodeURIComponent(channelId)}/play`, {
+            media: `sound:tts/${name}`,
+          });
+        } finally {
+          this.sweepTts(name).catch(() => undefined);
+        }
+      })
+      .catch((err: unknown) => {
+        this.hooks.log("warn", "reply playback failed", { callId: leg.callId, err: String(err) });
+      })
+      .then(() => {
+        if (this.sendQueues.get(channelId) === next) this.sendQueues.delete(channelId);
+      });
+    this.sendQueues.set(channelId, next);
+    return next;
+  }
+
+  private ttsPath(name: string): string {
+    return `${this.opts.ttsDir}/${name}.wav`;
+  }
+
+  private readonly played: string[] = [];
+
+  private async sweepTts(except: string): Promise<void> {
+    this.played.push(except);
+    if (this.played.length <= 20) return;
+    const { unlink } = await import("node:fs/promises");
+    const old = this.played.splice(0, this.played.length - 20);
+    for (const name of old) {
+      if (name === except) continue;
+      try {
+        await unlink(this.ttsPath(name));
+      } catch {
+        /* already gone */
+      }
+    }
+  }
 
   /** Send mono 16 kHz PCM16 into the call (TTS injection), paced in real time
    *  in 20 ms frames. Replies queue per channel: overlapping finals would
