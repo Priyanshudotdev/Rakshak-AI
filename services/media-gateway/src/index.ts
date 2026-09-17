@@ -234,12 +234,49 @@ function replyVoice(language?: string): { code: string; ack: string; confirm: (i
   };
 }
 
-/** Full loop for one final transcript: understand via process-call, then speak
- *  a calm reply back into the caller's ear, in their language. All best-effort. */
-async function handleFinal(callId: string, text: string, language?: string): Promise<void> {
+const OPERATOR_LANG: string = (() => {
+  const v = (process.env.OPERATOR_LANG ?? "en-IN").toLowerCase();
+  if (v.startsWith("hi")) return "hi-IN";
+  if (v.startsWith("mr")) return "mr-IN";
+  return "en-IN";
+})();
+
+/** Last detected language per call — routes operator speech toward it. */
+const langByCall = new Map<string, string>();
+
+async function translateAndSpeak(channelId: string, text: string, targetCode: string, source?: string): Promise<void> {
+  try {
+    const res = await fetch(`${API_URL}/api/translate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, target_language_code: targetCode, source_language_code: source }),
+    });
+    if (!res.ok) return;
+    const body = (await res.json()) as { data?: { translated_text?: string } };
+    const translated = body.data?.translated_text?.trim();
+    if (translated) await speak(channelId, translated, targetCode);
+  } catch (err) {
+    log("warn", "translate-speak failed", { channelId, err: String(err) });
+  }
+}
+
+/** Full loop, role-aware. Caller finals: incident extraction + reply in the
+ *  caller tongue, plus a same-language-echo-free translation for a joined
+ *  operator. Operator finals: translated toward the CALLER's tongue only —
+ *  operator speech never creates incidents. All best-effort. */
+async function handleFinal(callId: string, text: string, language: string | undefined, role: string): Promise<void> {
   if (!ari || !text.trim()) return;
+  if (language) langByCall.set(callId, language);
   const channelId = ari.channelForCall(callId);
   if (!channelId) return;
+  if (role === "operator") {
+    const peer = ari.bridgePeer(callId);
+    const callerLang = (peer && langByCall.get(peer.callId)) || "Marathi";
+    const callerChannel = peer ? ari.channelForCall(peer.callId) : null;
+    if (!callerChannel) return;
+    await translateAndSpeak(callerChannel, text, replyVoice(callerLang).code, language);
+    return;
+  }
   const voice = replyVoice(language);
   try {
     await speak(channelId, voice.ack, voice.code);
@@ -248,11 +285,18 @@ async function handleFinal(callId: string, text: string, language?: string): Pro
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ transcript: text, language: language ?? "Marathi" }),
     });
-    if (!res.ok) return;
-    const body = (await res.json()) as {
-      data?: { extraction?: { incident_type?: string }; priority?: { level?: string } };
-    };
-    await speak(channelId, voice.confirm(body.data?.extraction?.incident_type), voice.code);
+    if (res.ok) {
+      const body = (await res.json()) as {
+        data?: { extraction?: { incident_type?: string }; priority?: { level?: string } };
+      };
+      await speak(channelId, voice.confirm(body.data?.extraction?.incident_type), voice.code);
+    }
+    // Same bridge, other ear: operator hears the caller translated.
+    const peer = ari.bridgePeer(callId);
+    if (peer && peer.role === "operator") {
+      const opChannel = ari.channelForCall(peer.callId);
+      if (opChannel) await translateAndSpeak(opChannel, text, OPERATOR_LANG, language);
+    }
   } catch (err) {
     log("warn", "final-loop failed", { callId, err: String(err) });
   }
@@ -294,9 +338,9 @@ if (adapter.kind === "saaras-realtime") {
       log,
       adapter,
       synthesize: synthesizeSpeech,
-      onFinalTranscript: (callId, text, language) => {
-        void handleFinal(callId, text, language);
-      },
+    onFinalTranscript: (callId, text, language, role) => {
+      void handleFinal(callId, text, language, role ?? "caller");
+    },
     },
     {},
   );

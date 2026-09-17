@@ -63,6 +63,8 @@ services:
       GATEWAY_RTP_HOST: media-gateway
       # Same volume Asterisk reads as sounds/tts: replies play natively.
       TTS_FILE_DIR: /tts-out
+      # Voice the operator hears caller translations in (en-IN|hi-IN|mr-IN).
+      OPERATOR_LANG: ${OPERATOR_LANG:-en-IN}
     volumes:
       - tts_sounds:/tts-out
     ports:

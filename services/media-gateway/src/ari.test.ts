@@ -287,12 +287,14 @@ describe("AriController", () => {
     expect(ctx.published).toEqual([{ name: "call.ended", callId: expect.stringContaining("ARI-OP-") }]);
   });
 
-  it("bridges the operator into the live emergency call without a fork", async () => {
+  it("forks operator audio too and joins the same bridge", async () => {
     const ctx = setup();
     await startCall(ctx);
     await startOperator(ctx);
-    // Still exactly one media fork (the caller's).
-    expect(ctx.calls.filter((c) => c.url.includes("externalMedia"))).toHaveLength(1);
+    // One fork per leg: caller STT + operator STT (role-tagged downstream).
+    expect(ctx.calls.filter((c) => c.url.includes("externalMedia"))).toHaveLength(2);
+    // Operator joins the CALLER's bridge — no new bridge is created.
+    expect(ctx.calls.filter((c) => c.method === "POST" && c.url.split("?")[0].endsWith("/bridges"))).toHaveLength(1);
     const add = ctx.calls.find((c) => c.url.includes("addChannel") && JSON.stringify(c.body).includes("op-chan-01"));
     expect(add).toBeTruthy();
     expect(ctx.published).toContainEqual({ name: "call.answered", callId: expect.stringContaining("ARI-OP-") });

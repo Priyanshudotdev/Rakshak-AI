@@ -35,7 +35,7 @@ export interface AriHooks {
   log(level: string, msg: string, fields?: Record<string, unknown>): void;
   adapter: RealtimeAdapter;
   /** Full-loop handler: incident extraction + spoken reply for final transcripts. */
-  onFinalTranscript?: (callId: string, text: string, language?: string) => void;
+  onFinalTranscript?: (callId: string, text: string, language: string | undefined, role: LegRole) => void;
   /** Synthesize speech in the given language code. Returns wav bytes (or null). */
   synthesize?: (text: string, languageCode?: string) => Promise<Buffer | null>;
 }
@@ -319,8 +319,9 @@ export class AriController {
     }
   }
 
-  /** Operator join (1001 dials 9002): no fork, no STT — the operator channel
-   *  joins the newest live emergency bridge and hears/speaks with everyone.
+  /** Operator join (1001 dials 9002): own STT fork like a caller, then into
+   *  the newest live emergency bridge. Operator speech is transcribed with
+   *  role=operator so it translates toward the caller — never as incidents.
    *  Nobody waiting: polite hangup, the dashboard shows nothing to join. */
   private async setupOperator(channelId: string, caller: string): Promise<void> {
     const target = [...this.legs.values()].reverse().find((l) => l.role === "caller");
@@ -331,17 +332,18 @@ export class AriController {
       return;
     }
     const callId = `ARI-OP-${channelId.slice(0, 8).toUpperCase()}`;
+    const fork = await this.forkMedia(callId, channelId, "operator");
     await this.rest("POST", `channels/${encodeURIComponent(channelId)}/answer`);
-    await this.rest("POST", `bridges/${target.bridgeId}/addChannel`, { channel: [channelId] });
+    await this.rest("POST", `bridges/${target.bridgeId}/addChannel`, { channel: [channelId, fork.externalId] });
     this.legs.set(channelId, {
       callId,
       channelId,
-      externalId: "",
+      externalId: fork.externalId,
       bridgeId: target.bridgeId,
       role: "operator",
-      udp: null,
-      saaras: null,
-      rtpPort: -1,
+      udp: fork.udp,
+      saaras: fork.saaras,
+      rtpPort: fork.rtpPort,
       rxPackets: 0,
       rxBytes: 0,
       rxByPt: new Map(),
@@ -352,16 +354,21 @@ export class AriController {
     this.hooks.log("info", "operator joined emergency bridge", { callId, joined: target.callId });
   }
 
-  private async setupLeg(channelId: string, exten: string, caller: string): Promise<void> {
-    const callId = `ARI-${channelId.slice(0, 8).toUpperCase()}`;
-    this.hooks.publish("call.answered", callId, { via: "ari", exten, caller });
-
+  /** Shared media fork: Saaras session + one UDP port + External Media
+   *  channel. Role tags every final so caller speech (incidents + replies)
+   *  and operator speech (translate-only) route differently. */
+  private async forkMedia(
+    callId: string,
+    channelId: string,
+    role: LegRole,
+  ): Promise<{ udp: UdpSocket; saaras: RealtimeSession; rtpPort: number; externalId: string }> {
     const saaras = await this.hooks.adapter.connect(callId, {
-      onPartial: (text, language) => this.hooks.publish("transcript.partial", callId, { original_text: text, language: language ?? "Unknown" }),
+      onPartial: (text, language) =>
+        this.hooks.publish("transcript.partial", callId, { original_text: text, language: language ?? "Unknown", role }),
       onFinal: (text, language) => {
-        this.hooks.publish("transcript.final", callId, { original_text: text, language: language ?? "Unknown" });
+        this.hooks.publish("transcript.final", callId, { original_text: text, language: language ?? "Unknown", role });
         try {
-          this.hooks.onFinalTranscript?.(callId, text, language);
+          this.hooks.onFinalTranscript?.(callId, text, language, role);
         } catch (err) {
           this.hooks.log("warn", "final handler failed", { callId, err: String(err) });
         }
@@ -370,7 +377,7 @@ export class AriController {
       onClose: () => undefined,
     });
 
-    // One UDP port per call: no SSRC demux needed, trivially testable.
+    // One UDP port per leg: no SSRC demux needed, trivially testable.
     const rtpPort = this.nextRtpPort++;
     const udp = createSocket("udp4");
     udp.on("message", (msg, rinfo) => {
@@ -391,13 +398,13 @@ export class AriController {
       }
       const leg = this.legs.get(channelId);
       const pcm = rtpPayload(msg);
-      if (leg && pcm.length) {
+      if (leg?.saaras && pcm.length) {
         leg.rxPackets += 1;
         leg.rxBytes += pcm.length;
         const pt = msg.length >= 2 ? msg[1] & 0x7f : -1;
         leg.rxByPt.set(pt, (leg.rxByPt.get(pt) ?? 0) + 1);
         try {
-          saaras.sendAudio(pcm);
+          leg.saaras.sendAudio(pcm);
         } catch {
           /* session closing */
         }
@@ -408,7 +415,6 @@ export class AriController {
       udp.bind(rtpPort, "0.0.0.0", () => resolve());
     });
 
-    await this.rest("POST", `channels/${encodeURIComponent(channelId)}/answer`);
     const external = await this.rest("POST", "channels/externalMedia", {
       app: this.opts.app,
       external_host: `${this.opts.rtpHost}:${rtpPort}`,
@@ -419,18 +425,28 @@ export class AriController {
       direction: "both",
       variables: { RAKSHAK_CALL_ID: callId },
     });
+    return { udp, saaras, rtpPort, externalId: String(external.id) };
+  }
+
+  private async setupLeg(channelId: string, exten: string, caller: string): Promise<void> {
+    const callId = `ARI-${channelId.slice(0, 8).toUpperCase()}`;
+    this.hooks.publish("call.answered", callId, { via: "ari", exten, caller });
+
+    const fork = await this.forkMedia(callId, channelId, "caller");
+
+    await this.rest("POST", `channels/${encodeURIComponent(channelId)}/answer`);
     const bridge = await this.rest("POST", "bridges", { type: "mixing" });
-    await this.rest("POST", `bridges/${bridge.id}/addChannel`, { channel: [channelId, external.id] });
+    await this.rest("POST", `bridges/${bridge.id}/addChannel`, { channel: [channelId, fork.externalId] });
 
     this.legs.set(channelId, {
       callId,
       channelId,
-      externalId: String(external.id),
+      externalId: fork.externalId,
       bridgeId: String(bridge.id),
       role: "caller",
-      udp,
-      saaras,
-      rtpPort,
+      udp: fork.udp,
+      saaras: fork.saaras,
+      rtpPort: fork.rtpPort,
       rxPackets: 0,
       rxBytes: 0,
       rxByPt: new Map(),
@@ -449,12 +465,21 @@ export class AriController {
     }
     // Audible-silence watchdog: if Asterisk never streams, say so plainly
     // instead of failing mute.
+    const forkPort = fork.rtpPort;
     setTimeout(() => {
       const leg = this.legs.get(channelId);
       if (leg && leg.rxPackets === 0) {
-        this.hooks.log("warn", "no inbound RTP yet", { callId, rtpPort, hint: "caller mic muted or Asterisk not streaming" });
+        this.hooks.log("warn", "no inbound RTP yet", { callId, rtpPort: forkPort, hint: "caller mic muted or Asterisk not streaming" });
       }
     }, 8000);
+  }
+
+  /** The other leg sharing this call's bridge (caller↔operator), if any. */
+  bridgePeer(callId: string): { callId: string; channelId: string; role: LegRole } | null {
+    const leg = [...this.legs.values()].find((l) => l.callId === callId);
+    if (!leg) return null;
+    const other = [...this.legs.values()].find((l) => l.bridgeId === leg.bridgeId && l.channelId !== leg.channelId);
+    return other ? { callId: other.callId, channelId: other.channelId, role: other.role } : null;
   }
 
   /** Resolve the ARI channel behind a call id (for the reply path). */
