@@ -29,8 +29,9 @@ decides incidents, priorities or dispatches.
 
 ## Two real phones, same WiFi (free, no provider)
 
-On the Asterisk host PC, find its CURRENT WiFi IP (here: `192.168.1.52` —
-check often, DHCP changes break everything silently):
+Phones use the host's mDNS name (survives DHCP/WiFi moves — never use a raw
+IP, it rots). After changing WiFi, just restart the asterisk container; no
+config edits needed. Current host: `ROLEXHQ.local` (= `192.168.1.52` today).
 
 | Linphone field | Phone 1 | Phone 2 |
 |---|---|---|
