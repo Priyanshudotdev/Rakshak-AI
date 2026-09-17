@@ -127,13 +127,17 @@ export function parseWavHeader(wav: Buffer): {
   }
 }
 
+type LegRole = "caller" | "operator";
+
 interface Leg {
   callId: string;
   channelId: string;
+  /** Empty for operator legs (no media fork — they share the caller bridge). */
   externalId: string;
   bridgeId: string;
-  udp: UdpSocket;
-  saaras: RealtimeSession;
+  role: LegRole;
+  udp: UdpSocket | null;
+  saaras: RealtimeSession | null;
   rtpPort: number;
   rxPackets: number;
   rxBytes: number;
@@ -307,11 +311,45 @@ export class AriController {
     if (this.legs.has(channelId) || this.claimed.has(channelId)) return;
     this.claimed.add(channelId);
     try {
-      await this.setupLeg(channelId, exten, caller);
+      if (exten === "9002") await this.setupOperator(channelId, caller);
+      else await this.setupLeg(channelId, exten, caller);
     } catch (err) {
       this.claimed.delete(channelId);
       throw err;
     }
+  }
+
+  /** Operator join (1001 dials 9002): no fork, no STT — the operator channel
+   *  joins the newest live emergency bridge and hears/speaks with everyone.
+   *  Nobody waiting: polite hangup, the dashboard shows nothing to join. */
+  private async setupOperator(channelId: string, caller: string): Promise<void> {
+    const target = [...this.legs.values()].reverse().find((l) => l.role === "caller");
+    if (!target) {
+      this.hooks.log("info", "operator join with no live call", { caller });
+      await this.rest("POST", `channels/${encodeURIComponent(channelId)}/hangup`);
+      this.hooks.publish("call.ended", `ARI-${channelId.slice(0, 8).toUpperCase()}`, { reason: "no-live-call" });
+      return;
+    }
+    const callId = `ARI-OP-${channelId.slice(0, 8).toUpperCase()}`;
+    await this.rest("POST", `channels/${encodeURIComponent(channelId)}/answer`);
+    await this.rest("POST", `bridges/${target.bridgeId}/addChannel`, { channel: [channelId] });
+    this.legs.set(channelId, {
+      callId,
+      channelId,
+      externalId: "",
+      bridgeId: target.bridgeId,
+      role: "operator",
+      udp: null,
+      saaras: null,
+      rtpPort: -1,
+      rxPackets: 0,
+      rxBytes: 0,
+      rxByPt: new Map(),
+      txPackets: 0,
+      txBytes: 0,
+    });
+    this.hooks.publish("call.answered", callId, { via: "ari", role: "operator", joined: target.callId, caller });
+    this.hooks.log("info", "operator joined emergency bridge", { callId, joined: target.callId });
   }
 
   private async setupLeg(channelId: string, exten: string, caller: string): Promise<void> {
@@ -389,6 +427,7 @@ export class AriController {
       channelId,
       externalId: String(external.id),
       bridgeId: String(bridge.id),
+      role: "caller",
       udp,
       saaras,
       rtpPort,
@@ -513,7 +552,7 @@ export class AriController {
   private async sendOne(channelId: string, pcm16: Int16Array): Promise<void> {
     const leg = this.legs.get(channelId);
     const peer = leg ? this.peers.get(leg.rtpPort) : undefined;
-    if (!leg || !peer) return;
+    if (!leg?.udp || !peer) return;
     const FRAME = 320; // 20 ms @ 16 kHz
     let first = true;
     for (let i = 0; i < pcm16.length; i += FRAME) {
@@ -545,7 +584,7 @@ export class AriController {
   /** Feed one RTP packet (unit-test seam; the UDP path calls the same code). */
   feedRtp(channelId: string, packet: Buffer): void {
     const leg = this.legs.get(channelId);
-    if (!leg) return;
+    if (!leg?.saaras) return;
     const pcm = rtpPayload(packet);
     if (pcm.length) {
       try {
@@ -562,6 +601,7 @@ export class AriController {
     if (!leg) return;
     this.hooks.log("info", "ari leg stats", {
       callId: leg.callId,
+      role: leg.role,
       rxPackets: leg.rxPackets,
       rxBytes: leg.rxBytes,
       rxByPt: [...leg.rxByPt.entries()].map(([pt, n]) => `${pt}:${n}`).join(","),
@@ -572,14 +612,37 @@ export class AriController {
     this.legs.delete(channelId);
     this.peers.delete(leg.rtpPort);
     try {
-      leg.saaras.close();
+      leg.saaras?.close();
     } catch {
       /* ignore */
     }
     try {
-      leg.udp.close();
+      leg.udp?.close();
     } catch {
       /* ignore */
+    }
+    if (leg.role === "operator") {
+      // Operator leaves: free only their channel, the emergency leg continues.
+      try {
+        await this.rest("POST", `channels/${encodeURIComponent(channelId)}/hangup`);
+      } catch (err) {
+        this.hooks.log("warn", "teardown step failed", { callId: leg.callId, err: String(err) });
+      }
+      this.hooks.publish("call.ended", leg.callId, { reason: "operator-left" });
+      return;
+    }
+    // Caller leaves: clear joined operators first so nobody listens to dead air.
+    for (const [id, other] of [...this.legs]) {
+      if (other.role === "operator" && other.bridgeId === leg.bridgeId) {
+        this.legs.delete(id);
+        this.claimed.delete(id);
+        try {
+          await this.rest("POST", `channels/${encodeURIComponent(id)}/hangup`);
+        } catch {
+          /* already gone */
+        }
+        this.hooks.publish("call.ended", other.callId, { reason: "caller-left" });
+      }
     }
     for (const [method, path] of [
       ["DELETE", `bridges/${leg.bridgeId}`],

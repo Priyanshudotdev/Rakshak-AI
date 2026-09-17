@@ -178,6 +178,17 @@ export async function postDispatch(entry: {
   return json<{ status: string; data: import("./types").DispatchEntry; log: import("./types").DispatchEntry[] }>(res);
 }
 
+export type ListenVoice = "en-IN" | "hi-IN" | "mr-IN";
+
+export async function translate(text: string, target: ListenVoice, source?: string) {
+  const res = await fetch(`${API_URL}/api/translate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ text, target_language_code: target, source_language_code: source }),
+  });
+  return json<{ status: string; data: { translated_text: string; target: string } }>(res);
+}
+
 export async function synthesize(text: string, opts?: { language_code?: string; speaker?: string; record_id?: string }) {
   const res = await fetch(`${API_URL}/api/tts`, {
     method: "POST",

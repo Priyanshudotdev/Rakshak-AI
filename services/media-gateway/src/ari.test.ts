@@ -268,6 +268,52 @@ describe("AriController", () => {
     await ctx2.controller.playReply("chan-abc-12345678", "hi");
   });
 
+  async function startOperator(ctx: ReturnType<typeof setup>, channelId = "op-chan-01") {
+    ctx.socket().emit(
+      "message",
+      JSON.stringify({ type: "StasisStart", channel: { id: channelId, name: `PJSIP/1001-x`, caller: { number: "1001" } }, args: ["9002"] }),
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    return channelId;
+  }
+
+  it("hangs up operator joins with no live emergency call", async () => {
+    const ctx = setup();
+    await ctx.controller.start();
+    await startOperator(ctx);
+    expect(ctx.calls.filter((c) => c.url.includes("externalMedia"))).toHaveLength(0);
+    expect(ctx.calls.some((c) => c.url.includes("op-chan-01/hangup"))).toBe(true);
+    expect(ctx.published).toEqual([{ name: "call.ended", callId: expect.stringContaining("ARI-OP-") }]);
+  });
+
+  it("bridges the operator into the live emergency call without a fork", async () => {
+    const ctx = setup();
+    await startCall(ctx);
+    await startOperator(ctx);
+    // Still exactly one media fork (the caller's).
+    expect(ctx.calls.filter((c) => c.url.includes("externalMedia"))).toHaveLength(1);
+    const add = ctx.calls.find((c) => c.url.includes("addChannel") && JSON.stringify(c.body).includes("op-chan-01"));
+    expect(add).toBeTruthy();
+    expect(ctx.published).toContainEqual({ name: "call.answered", callId: expect.stringContaining("ARI-OP-") });
+  });
+
+  it("operator hangup leaves the emergency leg alive; caller hangup clears all", async () => {
+    const ctx = setup();
+    const caller = await startCall(ctx, "chan-caller-1");
+    const op = await startOperator(ctx, "op-chan-1");
+    // Operator leaves: only their channel hung up, no bridge delete.
+    ctx.socket().emit("message", JSON.stringify({ type: "StasisEnd", channel: { id: op } }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(ctx.calls.some((c) => c.url.includes("op-chan-1/hangup"))).toBe(true);
+    expect(ctx.calls.some((c) => c.method === "DELETE" && c.url.includes("bridges"))).toBe(false);
+    expect(ctx.published.at(-1)).toEqual({ name: "call.ended", callId: expect.stringContaining("ARI-OP-") });
+    // Caller leaves: everything torn down.
+    ctx.socket().emit("message", JSON.stringify({ type: "StasisEnd", channel: { id: caller } }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(ctx.calls.some((c) => c.method === "DELETE" && c.url.includes("bridges"))).toBe(true);
+    expect(ctx.published.at(-1)).toMatchObject({ name: "call.ended" });
+  });
+
   it("survives malformed frames and failed REST calls", async () => {
     const ctx = setup();
     await ctx.controller.start();

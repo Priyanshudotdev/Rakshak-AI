@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   audioUrl,
@@ -20,6 +20,8 @@ import {
   setOperatorName,
   signedInOperator,
   synthesize,
+  translate,
+  type ListenVoice,
 } from "../lib/api";
 import type { LiveEvent } from "../lib/live";
 import { useLiveEvents } from "../lib/live";
@@ -534,6 +536,102 @@ function RecordDetail({ record, events }: { record: IncidentRecord | null; event
   );
 }
 
+/* ---------------- Operator listen ---------------- */
+
+const LISTEN_KEY = "rakshak.listen-lang";
+const LISTEN_VOICES: Array<{ code: ListenVoice; label: string }> = [
+  { code: "en-IN", label: "English" },
+  { code: "hi-IN", label: "Hindi" },
+  { code: "mr-IN", label: "Marathi" },
+];
+
+function listenVoice(): ListenVoice {
+  try {
+    const v = localStorage.getItem(LISTEN_KEY);
+    if (v === "hi-IN" || v === "mr-IN" || v === "en-IN") return v;
+  } catch {
+    /* ignore */
+  }
+  return "en-IN";
+}
+
+/** Operator-only translated listening: latest live utterance rendered in the
+ *  operator's chosen language. Caller hears nothing of this — it plays in the
+ *  operator's browser only. Language is auto-detected per utterance. */
+function OperatorListen({ feed }: { feed: { events: LiveEvent[] } }) {
+  const [voice, setVoice] = useState<ListenVoice>(listenVoice);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [src, setSrc] = useState<string | null>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const latest = feed.events.find((e) => e.name === "transcript.final");
+  const payload = (latest?.payload ?? {}) as { original_text?: string; language?: string };
+  const text = payload.original_text ?? "";
+  return (
+    <Card>
+      <CardHead
+        title="Operator listen"
+        sub="Private translation — caller never hears this"
+        right={payload.language ? <Badge tone="info">{payload.language}</Badge> : null}
+      />
+      <CardBody>
+        {!text ? (
+          <EmptyState title="No live speech yet" sub="Latest caller utterance with auto-detected language appears here." />
+        ) : (
+          <>
+            <p className="text-sm text-cream">{text}</p>
+            <p className="mt-1 font-mono text-xs text-muted">{latest?.callId ?? ""}</p>
+          </>
+        )}
+        <div className="mt-2 flex items-center gap-2">
+          <div className="flex overflow-hidden rounded-md2 border border-line text-xs">
+            {LISTEN_VOICES.map((v) => (
+              <button
+                key={v.code}
+                onClick={() => {
+                  setVoice(v.code);
+                  try {
+                    localStorage.setItem(LISTEN_KEY, v.code);
+                  } catch {
+                    /* ignore */
+                  }
+                }}
+                className={`px-2.5 py-1 ${voice === v.code ? "bg-accent text-white" : "text-muted hover:text-cream"}`}
+              >
+                {v.label}
+              </button>
+            ))}
+          </div>
+          <Button
+            disabled={busy || !text}
+            onClick={() => {
+              setBusy(true);
+              setError(null);
+              translate(text, voice, payload.language)
+                .then((t) => synthesize(t.data.translated_text, { language_code: voice }))
+                .then((s) => {
+                  setSrc(s.data.audio_base64);
+                  setBusy(false);
+                  audioRef.current?.play().catch(() => undefined);
+                })
+                .catch((e: Error) => {
+                  setError(e.message || "Translation failed");
+                  setBusy(false);
+                });
+            }}
+          >
+            {busy ? <Spinner /> : "▶ Listen"}
+          </Button>
+        </div>
+        {error ? (
+          <p className="mt-1 text-xs text-red-400">{error}</p>
+        ) : null}
+        {src ? <audio ref={audioRef} className="mt-2 w-full" controls preload="none" src={src} /> : null}
+      </CardBody>
+    </Card>
+  );
+}
+
 /* ---------------- Dispatch log ---------------- */
 
 function DispatchPanel() {
@@ -668,6 +766,7 @@ export function OpsConsole() {
           <div className="space-y-4">
             <IntakePanel onDone={(id) => setSelectedId(id)} />
             <LivePanel feed={feed} />
+            <OperatorListen feed={feed} />
             <DispatchPanel />
           </div>
           <RecordsPanel selectedId={selectedId} onSelect={(id) => setSelectedId(id)} />

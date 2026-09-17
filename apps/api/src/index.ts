@@ -230,6 +230,27 @@ app.post("/api/tts", async (req, reply) => {
   }
 });
 
+// Operator listen path: translate one utterance for private playback.
+// Costs an API call per use, so it shares the mutating-route auth gate.
+app.post("/api/translate", async (req, reply) => {
+  if (!(await requireAuth(req, reply))) return;
+  const parsed = z
+    .object({
+      text: z.string().min(1).max(2000),
+      target_language_code: z.string().default("en-IN"),
+      source_language_code: z.string().optional(),
+    })
+    .safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ status: "error", message: "text is required" });
+  try {
+    const translated = await sarvam.translateText(parsed.data.text, parsed.data.target_language_code, parsed.data.source_language_code);
+    return { status: "success", data: { translated_text: translated, target: parsed.data.target_language_code } };
+  } catch (err) {
+    const e = serverError(err);
+    return reply.code(e.code).send(e.body);
+  }
+});
+
 const sourceSchema = z.object({
   report_id: z.string().min(1, "report_id is required"),
   source: z.string().max(100).optional(),

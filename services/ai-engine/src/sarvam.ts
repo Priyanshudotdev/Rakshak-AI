@@ -70,6 +70,35 @@ export async function translateToMarathi(text: string, sourceLanguageCode?: stri
   }
 }
 
+const OPERATOR_VOICES = ["en-IN", "hi-IN", "mr-IN"] as const;
+export type OperatorVoice = (typeof OPERATOR_VOICES)[number];
+
+/** Generic translation for the operator-listen path. Same-code requests echo. */
+export async function translateText(
+  text: string,
+  target: string,
+  sourceLanguageCode?: string | null,
+): Promise<string> {
+  const clean = (text || "").trim();
+  if (!clean) return "";
+  const want = (OPERATOR_VOICES as readonly string[]).includes(target) ? target : "en-IN";
+  const src = (sourceLanguageCode || "auto").toLowerCase();
+  if (src === want.toLowerCase() || src === want.split("-")[0]) return clean;
+  let source = sourceLanguageCode || "auto";
+  if (source === "unknown") source = "auto";
+  try {
+    const data = await postJson("/translate", {
+      input: clean.slice(0, 2000),
+      source_language_code: source,
+      target_language_code: want,
+      model: translateModel(source),
+    }, TEXT_TIMEOUT, "operator translation");
+    return data?.translated_text ?? clean;
+  } catch {
+    return clean;
+  }
+}
+
 export async function transcribeAudio(fileBytes: Uint8Array, filename = "call.webm"): Promise<{ transcript: string; language_code?: string; language: string; confidence: number; request_id?: string }> {
   return withTimeout(async () => {
     const form = new FormData();
