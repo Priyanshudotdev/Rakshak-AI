@@ -251,9 +251,10 @@ describe("AriController", () => {
     );
     const channelId = await startCall(ctx);
     await ctx.controller.playReply(channelId, "madat pathvat aahe");
-    expect(synthArgs).toEqual([["madat pathvat aahe", "mr-IN"]]);
+    // startCall itself triggers the Marathi greeting synthesis first.
+    expect(synthArgs).toContainEqual(["madat pathvat aahe", "mr-IN"]);
     await ctx.controller.playReply(channelId, "Got it", "en-IN");
-    expect(synthArgs[1]).toEqual(["Got it", "en-IN"]);
+    expect(synthArgs).toContainEqual(["Got it", "en-IN"]);
     const play = ctx.calls.find((c) => c.url.includes("/play"));
     expect(play?.method).toBe("POST");
     expect(String(play?.url)).toContain(`channels/${channelId}/play`);
