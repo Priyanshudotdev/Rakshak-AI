@@ -235,12 +235,19 @@ async function synthesizeSpeech(text: string): Promise<Buffer | null> {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, language_code: "mr-IN" }),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      log("warn", "tts synth rejected", { status: res.status });
+      return null;
+    }
     const body = (await res.json()) as { data?: { audio_base64?: string } };
     const b64 = (body.data?.audio_base64 ?? "").split(",", 2)[1] ?? "";
-    if (!b64) return null;
+    if (!b64) {
+      log("warn", "tts synth empty");
+      return null;
+    }
     return Buffer.from(b64, "base64");
-  } catch {
+  } catch (err) {
+    log("warn", "tts synth failed", { err: String(err) });
     return null;
   }
 }

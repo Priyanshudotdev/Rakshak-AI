@@ -409,16 +409,27 @@ export class AriController {
     const prev = this.sendQueues.get(channelId) ?? Promise.resolve();
     const next = prev
       .then(async () => {
-        if (!this.legs.has(channelId)) return;
+        if (!this.legs.has(channelId)) {
+          this.hooks.log("warn", "reply skipped, leg gone", { callId: leg.callId });
+          return;
+        }
         const wav = await this.hooks.synthesize!(text);
-        if (!wav || !this.legs.has(channelId)) return;
+        if (!wav) {
+          this.hooks.log("warn", "reply skipped, no audio", { callId: leg.callId });
+          return;
+        }
+        if (!this.legs.has(channelId)) {
+          this.hooks.log("warn", "reply skipped, leg gone", { callId: leg.callId });
+          return;
+        }
         const name = `tts-${leg.callId}-${Date.now().toString(36)}`;
         await mkdir(dirname(this.ttsPath(name)), { recursive: true });
         await writeFile(this.ttsPath(name), wav);
         try {
-          await this.rest("POST", `channels/${encodeURIComponent(channelId)}/play`, {
+          const playback = await this.rest("POST", `channels/${encodeURIComponent(channelId)}/play`, {
             media: `sound:tts/${name}`,
           });
+          this.hooks.log("info", "reply playing", { callId: leg.callId, playback: playback?.id ?? "?" });
         } finally {
           this.sweepTts(name).catch(() => undefined);
         }
