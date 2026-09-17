@@ -438,6 +438,15 @@ export class AriController {
       txBytes: 0,
     });
     this.hooks.log("info", "ari leg bridged", { callId, exten });
+    // Greeting FIRST: an emergency caller waiting in silence assumes the line
+    // is dead and says nothing worth transcribing (proven by a 27 s silent
+    // recording). The prompt tells them they're connected and what to say.
+    if (exten !== "9002") {
+      void this.playReply(
+        channelId,
+        "रक्षक आपत्कालीन सेवा. कृपया आपले ठिकाण आणि काय घडले ते सांगा.",
+      ).catch(() => undefined);
+    }
     // Audible-silence watchdog: if Asterisk never streams, say so plainly
     // instead of failing mute.
     setTimeout(() => {
