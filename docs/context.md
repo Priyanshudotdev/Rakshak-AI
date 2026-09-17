@@ -110,6 +110,21 @@ non-audio packet) or Asterisk dropping our packets (SSRC/timestamp/marker).
 4. Then: incident cards from ARI finals already flow via `handleFinal` →
    process-call; confirm card appears for a 9000 call.
 
+## 5b. Phone connectivity outage (2026-09-17, unresolved at pause)
+
+- Symptom: both Linphones IOError, zero REGISTERs reach Asterisk.
+- Proven: native UDP works, TCP works, mappings correct, Asterisk up,
+  firewall Docker rules widened to Any, daemon updated 29.7.2→29.8.0,
+  network pruned + stack rebuilt — UDP ingress to containers still dead
+  from all outside sources (phones + LAN hairpin probe).
+- Prime suspect: Docker Desktop UDP forwarder (vpnkit) wedged, or chingam
+  router path; NOT Asterisk config (transports/endpoints verified loaded).
+- Next: user restarts laptop on charger (also refreshes DHCP/vpnkit), then
+  re-probe (`OPTIONS` to .229:5060 must appear in `docker logs` with pjsip
+  logger on). If still dead: Docker factory reset / reinstall.
+- Note: laptop IP keeps moving (.229 → .52 → .229) — always re-check with
+  `Get-NetIPAddress` and rerun `infrastructure/asterisk/use-lan-ip.ps1`.
+
 ## 6. Remaining roadmap (after audio)
 
 - TTS reply volume/pacing tuning against a real ear; per-utterance incident
