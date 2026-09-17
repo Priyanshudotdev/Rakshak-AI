@@ -387,6 +387,7 @@ export class AriController {
     const peer = leg ? this.peers.get(leg.rtpPort) : undefined;
     if (!leg || !peer) return;
     const FRAME = 320; // 20 ms @ 16 kHz
+    let first = true;
     for (let i = 0; i < pcm16.length; i += FRAME) {
       if (!this.legs.has(channelId)) return; // hung up mid-reply
       if (leg) {
