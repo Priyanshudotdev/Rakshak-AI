@@ -1,5 +1,8 @@
 # Rakshak AI — full session context (2026-09-16, feat/v2-architecture)
 
+opencode session id: `ses_f567fed93ffeUmx0yds8Wt0GjE` (slug `glowing-cactus`,
+project dir `C:/Users/priya/Code/testing/hack/Rakshak AI - Vikshit Bharat Hackathon`). {opencode -s ses_f567fed93ffeUmx0yds8Wt0GjE}
+
 Handoff file: everything done, everything verified, and the one open issue
 with the complete debugging trail. Next session: start at "Open issue".
 
