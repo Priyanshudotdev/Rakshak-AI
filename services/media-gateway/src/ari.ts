@@ -36,8 +36,8 @@ export interface AriHooks {
   adapter: RealtimeAdapter;
   /** Full-loop handler: incident extraction + spoken reply for final transcripts. */
   onFinalTranscript?: (callId: string, text: string, language?: string) => void;
-  /** Synthesize Marathi speech. Returns the complete wav bytes (or null). */
-  synthesize?: (text: string) => Promise<Buffer | null>;
+  /** Synthesize speech in the given language code. Returns wav bytes (or null). */
+  synthesize?: (text: string, languageCode?: string) => Promise<Buffer | null>;
 }
 
 interface RtpPeer {
@@ -422,7 +422,7 @@ export class AriController {
   /** Speak text into the call via Asterisk's own playback (reliable path).
    *  Writes the wav to the shared sounds volume and plays it on the CALLER
    *  channel — no hand-built RTP involved. Serialized per channel. */
-  async playReply(channelId: string, text: string): Promise<void> {
+  async playReply(channelId: string, text: string, languageCode = "mr-IN"): Promise<void> {
     const leg = this.legs.get(channelId);
     if (!leg || !this.hooks.synthesize) return;
     const prev = this.sendQueues.get(channelId) ?? Promise.resolve();
@@ -432,7 +432,7 @@ export class AriController {
           this.hooks.log("warn", "reply skipped, leg gone", { callId: leg.callId });
           return;
         }
-        const wav = await this.hooks.synthesize!(text);
+        const wav = await this.hooks.synthesize!(text, languageCode);
         if (!wav) {
           this.hooks.log("warn", "reply skipped, no audio", { callId: leg.callId });
           return;

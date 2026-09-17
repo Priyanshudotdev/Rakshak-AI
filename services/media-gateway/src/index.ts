@@ -200,14 +200,49 @@ setInterval(() => {
 // audio into the Saaras adapter. Replay mode keeps the WS batch path above.
 let ari: AriController | null = null;
 
+/** Reply voice follows the CALLER's language (spec §5): Marathi, Hindi or
+ *  English — detected per utterance, Marathi default. */
+function replyVoice(language?: string): { code: string; ack: string; confirm: (incident?: string) => string } {
+  const lang = (language ?? "").toLowerCase();
+  if (lang.startsWith("hi") || lang.includes("hindi")) {
+    return {
+      code: "hi-IN",
+      ack: "जानकारी मिल गई है, जाँच रहे हैं।",
+      confirm: (incident) =>
+        incident && incident !== "Unknown"
+          ? `आपकी रिपोर्ट दर्ज हो गई है। ${incident} के लिए मदद भेज रहे हैं।`
+          : "आपकी रिपोर्ट दर्ज हो गई है, मदद जल्द पहुँचेगी।",
+    };
+  }
+  if (lang.startsWith("en") || lang.includes("english")) {
+    return {
+      code: "en-IN",
+      ack: "Got it, checking now.",
+      confirm: (incident) =>
+        incident && incident !== "Unknown"
+          ? `Your report is recorded. Help is on the way for the ${incident}.`
+          : "Your report is recorded, help will arrive soon.",
+    };
+  }
+  return {
+    code: "mr-IN",
+    ack: "माहिती मिळाली, तपासत आहे.",
+    confirm: (incident) =>
+      incident && incident !== "Unknown"
+        ? `आपली तक्रार नोंदवली आहे. ${incident} साठी मदत पाठवत आहोत.`
+        : "आपली तक्रार नोंदवली आहे, मदत लवकरच पोहोचेल.",
+  };
+}
+
 /** Full loop for one final transcript: understand via process-call, then speak
- *  a calm Marathi reply back into the caller's ear. All best-effort. */
+ *  a calm reply back into the caller's ear, in their language. All best-effort. */
 async function handleFinal(callId: string, text: string, language?: string): Promise<void> {
   if (!ari || !text.trim()) return;
   const channelId = ari.channelForCall(callId);
   if (!channelId) return;
+  const voice = replyVoice(language);
   try {
-    await speak(channelId, "माहिती मिळाली, तपासत आहे.");
+    await speak(channelId, voice.ack, voice.code);
     const res = await fetch(`${API_URL}/api/process-call`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -217,23 +252,18 @@ async function handleFinal(callId: string, text: string, language?: string): Pro
     const body = (await res.json()) as {
       data?: { extraction?: { incident_type?: string }; priority?: { level?: string } };
     };
-    const incident = body.data?.extraction?.incident_type;
-    const reply =
-      incident && incident !== "Unknown"
-        ? `आपली तक्रार नोंदवली आहे. ${incident} साठी मदत पाठवत आहोत.`
-        : "आपली तक्रार नोंदवली आहे, मदत लवकरच पोहोचेल.";
-    await speak(channelId, reply);
+    await speak(channelId, voice.confirm(body.data?.extraction?.incident_type), voice.code);
   } catch (err) {
     log("warn", "final-loop failed", { callId, err: String(err) });
   }
 }
 
-async function synthesizeSpeech(text: string): Promise<Buffer | null> {
+async function synthesizeSpeech(text: string, languageCode = "mr-IN"): Promise<Buffer | null> {
   try {
     const res = await fetch(`${API_URL}/api/tts`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, language_code: "mr-IN" }),
+      body: JSON.stringify({ text, language_code: languageCode }),
     });
     if (!res.ok) {
       log("warn", "tts synth rejected", { status: res.status });
@@ -252,9 +282,9 @@ async function synthesizeSpeech(text: string): Promise<Buffer | null> {
   }
 }
 
-async function speak(channelId: string, text: string): Promise<void> {
+async function speak(channelId: string, text: string, languageCode = "mr-IN"): Promise<void> {
   if (!ari) return;
-  await ari.playReply(channelId, text);
+  await ari.playReply(channelId, text, languageCode);
 }
 
 if (adapter.kind === "saaras-realtime") {

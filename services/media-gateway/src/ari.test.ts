@@ -239,12 +239,21 @@ describe("AriController", () => {
   it("plays replies via Asterisk file playback on the caller channel", async () => {
     const tmp = await mkdtemp(join(tmpdir(), "tts-"));
     const wav = Buffer.from("RIFF....WAVEfakepcm");
+    const synthArgs: Array<[string, string | undefined]> = [];
     const ctx = setup(
       { ttsDir: tmp },
-      { synthesize: async () => wav },
+      {
+        synthesize: async (text: string, code?: string) => {
+          synthArgs.push([text, code]);
+          return wav;
+        },
+      },
     );
     const channelId = await startCall(ctx);
     await ctx.controller.playReply(channelId, "madat pathvat aahe");
+    expect(synthArgs).toEqual([["madat pathvat aahe", "mr-IN"]]);
+    await ctx.controller.playReply(channelId, "Got it", "en-IN");
+    expect(synthArgs[1]).toEqual(["Got it", "en-IN"]);
     const play = ctx.calls.find((c) => c.url.includes("/play"));
     expect(play?.method).toBe("POST");
     expect(String(play?.url)).toContain(`channels/${channelId}/play`);
