@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { WebSocketServer, type WebSocket } from "ws";
 import { SessionManager } from "./session.js";
 import { AriController } from "./ari.js";
+import { createConversation } from "./conversation.js";
 import { createAdapter } from "./saaras.js";
 
 // Media Gateway (spec §7): Asterisk media <-> Sarvam STT transport + session mgmt.
@@ -200,40 +201,6 @@ setInterval(() => {
 // audio into the Saaras adapter. Replay mode keeps the WS batch path above.
 let ari: AriController | null = null;
 
-/** Reply voice follows the CALLER's language (spec §5): Marathi, Hindi or
- *  English — detected per utterance, Marathi default. */
-function replyVoice(language?: string): { code: string; ack: string; confirm: (incident?: string) => string } {
-  const lang = (language ?? "").toLowerCase();
-  if (lang.startsWith("hi") || lang.includes("hindi")) {
-    return {
-      code: "hi-IN",
-      ack: "जानकारी मिल गई है, जाँच रहे हैं।",
-      confirm: (incident) =>
-        incident && incident !== "Unknown"
-          ? `आपकी रिपोर्ट दर्ज हो गई है। ${incident} के लिए मदद भेज रहे हैं।`
-          : "आपकी रिपोर्ट दर्ज हो गई है, मदद जल्द पहुँचेगी।",
-    };
-  }
-  if (lang.startsWith("en") || lang.includes("english")) {
-    return {
-      code: "en-IN",
-      ack: "Got it, checking now.",
-      confirm: (incident) =>
-        incident && incident !== "Unknown"
-          ? `Your report is recorded. Help is on the way for the ${incident}.`
-          : "Your report is recorded, help will arrive soon.",
-    };
-  }
-  return {
-    code: "mr-IN",
-    ack: "माहिती मिळाली, तपासत आहे.",
-    confirm: (incident) =>
-      incident && incident !== "Unknown"
-        ? `आपली तक्रार नोंदवली आहे. ${incident} साठी मदत पाठवत आहोत.`
-        : "आपली तक्रार नोंदवली आहे, मदत लवकरच पोहोचेल.",
-  };
-}
-
 const OPERATOR_LANG: string = (() => {
   const v = (process.env.OPERATOR_LANG ?? "en-IN").toLowerCase();
   if (v.startsWith("hi")) return "hi-IN";
@@ -241,66 +208,13 @@ const OPERATOR_LANG: string = (() => {
   return "en-IN";
 })();
 
-/** Last detected language per call — routes operator speech toward it. */
-const langByCall = new Map<string, string>();
-
-async function translateAndSpeak(channelId: string, text: string, targetCode: string, source?: string): Promise<void> {
-  try {
-    const res = await fetch(`${API_URL}/api/translate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, target_language_code: targetCode, source_language_code: source }),
-    });
-    if (!res.ok) return;
-    const body = (await res.json()) as { data?: { translated_text?: string } };
-    const translated = body.data?.translated_text?.trim();
-    if (translated) await speak(channelId, translated, targetCode);
-  } catch (err) {
-    log("warn", "translate-speak failed", { channelId, err: String(err) });
-  }
-}
-
-/** Full loop, role-aware. Caller finals: incident extraction + reply in the
- *  caller tongue, plus a same-language-echo-free translation for a joined
- *  operator. Operator finals: translated toward the CALLER's tongue only —
- *  operator speech never creates incidents. All best-effort. */
-async function handleFinal(callId: string, text: string, language: string | undefined, role: string): Promise<void> {
-  if (!ari || !text.trim()) return;
-  if (language) langByCall.set(callId, language);
-  const channelId = ari.channelForCall(callId);
-  if (!channelId) return;
-  if (role === "operator") {
-    const peer = ari.bridgePeer(callId);
-    const callerLang = (peer && langByCall.get(peer.callId)) || "Marathi";
-    const callerChannel = peer ? ari.channelForCall(peer.callId) : null;
-    if (!callerChannel) return;
-    await translateAndSpeak(callerChannel, text, replyVoice(callerLang).code, language);
-    return;
-  }
-  const voice = replyVoice(language);
-  try {
-    await speak(channelId, voice.ack, voice.code);
-    const res = await fetch(`${API_URL}/api/process-call`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ transcript: text, language: language ?? "Marathi" }),
-    });
-    if (res.ok) {
-      const body = (await res.json()) as {
-        data?: { extraction?: { incident_type?: string }; priority?: { level?: string } };
-      };
-      await speak(channelId, voice.confirm(body.data?.extraction?.incident_type), voice.code);
-    }
-    // Same bridge, other ear: operator hears the caller translated.
-    const peer = ari.bridgePeer(callId);
-    if (peer && peer.role === "operator") {
-      const opChannel = ari.channelForCall(peer.callId);
-      if (opChannel) await translateAndSpeak(opChannel, text, OPERATOR_LANG, language);
-    }
-  } catch (err) {
-    log("warn", "final-loop failed", { callId, err: String(err) });
-  }
-}
+const conversation = createConversation({
+  ari: () => ari,
+  apiUrl: API_URL,
+  log,
+  operatorLang: OPERATOR_LANG,
+});
+const handleFinal = conversation.handleFinal;
 
 async function synthesizeSpeech(text: string, languageCode = "mr-IN"): Promise<Buffer | null> {
   try {
@@ -324,11 +238,6 @@ async function synthesizeSpeech(text: string, languageCode = "mr-IN"): Promise<B
     log("warn", "tts synth failed", { err: String(err) });
     return null;
   }
-}
-
-async function speak(channelId: string, text: string, languageCode = "mr-IN"): Promise<void> {
-  if (!ari) return;
-  await ari.playReply(channelId, text, languageCode);
 }
 
 if (adapter.kind === "saaras-realtime") {
