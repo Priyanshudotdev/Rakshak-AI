@@ -379,10 +379,25 @@ export class AriController {
     return null;
   }
 
+  private readonly sendQueues = new Map<string, Promise<void>>();
+
   /** Send mono 16 kHz PCM16 into the call (TTS injection), paced in real time
-   *  in 20 ms frames. No-op until the first inbound packet teaches us the
-   *  return path. Fire-and-forget: resolves when fully played. */
-  async sendCallAudio(channelId: string, pcm16: Int16Array): Promise<void> {
+   *  in 20 ms frames. Replies queue per channel: overlapping finals would
+   *  otherwise interleave packet streams (shared seq/timestamp) into garbage.
+   *  No-op until the first inbound packet teaches us the return path. */
+  sendCallAudio(channelId: string, pcm16: Int16Array): Promise<void> {
+    const prev = this.sendQueues.get(channelId) ?? Promise.resolve();
+    const next = prev
+      .then(() => this.sendOne(channelId, pcm16))
+      .catch(() => undefined)
+      .then(() => {
+        if (this.sendQueues.get(channelId) === next) this.sendQueues.delete(channelId);
+      });
+    this.sendQueues.set(channelId, next);
+    return next;
+  }
+
+  private async sendOne(channelId: string, pcm16: Int16Array): Promise<void> {
     const leg = this.legs.get(channelId);
     const peer = leg ? this.peers.get(leg.rtpPort) : undefined;
     if (!leg || !peer) return;

@@ -204,6 +204,26 @@ describe("AriController", () => {
     ).toHaveLength(1);
   });
 
+  it("serializes overlapping replies instead of interleaving streams", async () => {
+    const { createSocket } = await import("node:dgram");
+    const ctx = setup();
+    const channelId = await startCall(ctx);
+    // Teach the return path with one real loopback RTP packet.
+    const sock = createSocket("udp4");
+    const probe = rtpPacket([1, 2, 3, 4]);
+    const portGuess = (ctx.controller as unknown as { nextRtpPort: number }).nextRtpPort - 1;
+    await new Promise<void>((resolve, reject) => {
+      sock.send(probe, portGuess, "127.0.0.1", (err) => (err ? reject(err) : resolve()));
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    sock.close();
+    // Two overlapping one-frame replies must both complete, in order.
+    const one = new Int16Array(320).fill(100);
+    const two = new Int16Array(320).fill(200);
+    await Promise.all([ctx.controller.sendCallAudio(channelId, one), ctx.controller.sendCallAudio(channelId, two)]);
+    expect(ctx.controller.channelForCall("unknown")).toBeNull();
+  });
+
   it("survives malformed frames and failed REST calls", async () => {
     const ctx = setup();
     await ctx.controller.start();
