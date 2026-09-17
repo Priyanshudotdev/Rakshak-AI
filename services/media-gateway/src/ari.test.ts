@@ -2,7 +2,7 @@ import { mkdtemp, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { AriController, parseWavHeader, resampleLinear16, rtpPayload, type SocketLike } from "./ari.js";
+import { AriController, buildWav16, parseWavHeader, resampleLinear16, rtpPayload, type SocketLike } from "./ari.js";
 import type { RealtimeAdapter } from "./saaras.js";
 
 class FakeSocket implements SocketLike {
@@ -48,6 +48,13 @@ describe("rtpPayload", () => {
   it("returns empty for short or truncated packets", () => {
     expect(rtpPayload(Buffer.from([1, 2])).length).toBe(0);
     expect(rtpPayload(Buffer.alloc(0)).length).toBe(0);
+  });
+});
+
+describe("buildWav16", () => {
+  it("round-trips through the chunk parser", () => {
+    const wav = buildWav16(new Int16Array([0, 1000, -1000, 300]), 8000);
+    expect(parseWavHeader(wav)).toMatchObject({ sampleRate: 8000, channels: 1, bits: 16, dataLength: 8 });
   });
 });
 

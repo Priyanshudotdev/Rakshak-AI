@@ -50,6 +50,25 @@ interface RtpPeer {
   pt: number;
 }
 
+/** Build a minimal 16-bit mono WAV at the given rate. Pure, unit-tested. */
+export function buildWav16(samples: Int16Array, sampleRate: number): Buffer {
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + samples.length * 2, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(samples.length * 2, 40);
+  return Buffer.concat([header, Buffer.from(samples.buffer, samples.byteOffset, samples.length * 2)]);
+}
+
 /** Naive linear-interpolation resampler for mono int16 (test-harness grade). */
 export function resampleLinear16(samples: Int16Array, fromRate: number, toRate: number): Int16Array {
   if (fromRate === toRate) return samples;
@@ -422,9 +441,19 @@ export class AriController {
           this.hooks.log("warn", "reply skipped, leg gone", { callId: leg.callId });
           return;
         }
+        // Normalize to telephony-native 8 kHz/16-bit mono: 22050 Hz uploads
+        // played silent, so remove all transcoding ambiguity server-side.
+        const info = parseWavHeader(wav);
+        let out = wav;
+        if (info && (info.sampleRate !== 8000 || info.channels !== 1 || info.bits !== 16)) {
+          const count = Math.floor(Math.min(info.dataLength, wav.length - info.dataOffset) / 2);
+          const pcm = new Int16Array(wav.buffer, wav.byteOffset + info.dataOffset, count);
+          out = buildWav16(resampleLinear16(pcm, info.sampleRate, 8000), 8000);
+          this.hooks.log("info", "tts normalized", { callId: leg.callId, from: info.sampleRate });
+        }
         const name = `tts-${leg.callId}-${Date.now().toString(36)}`;
         await mkdir(dirname(this.ttsPath(name)), { recursive: true });
-        await writeFile(this.ttsPath(name), wav);
+        await writeFile(this.ttsPath(name), out);
         try {
           const playback = await this.rest("POST", `channels/${encodeURIComponent(channelId)}/play`, {
             media: `sound:tts/${name}`,
