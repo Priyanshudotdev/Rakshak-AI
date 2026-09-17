@@ -112,6 +112,9 @@ interface Leg {
   rtpPort: number;
   rxPackets: number;
   rxBytes: number;
+  rxByPt: Map<number, number>;
+  txPackets: number;
+  txBytes: number;
 }
 
 /** Strip an RTP header (handles CSRC list + one extension header). */
@@ -315,6 +318,8 @@ export class AriController {
       if (leg && pcm.length) {
         leg.rxPackets += 1;
         leg.rxBytes += pcm.length;
+        const pt = msg.length >= 2 ? msg[1] & 0x7f : -1;
+        leg.rxByPt.set(pt, (leg.rxByPt.get(pt) ?? 0) + 1);
         try {
           saaras.sendAudio(pcm);
         } catch {
@@ -351,6 +356,9 @@ export class AriController {
       rtpPort,
       rxPackets: 0,
       rxBytes: 0,
+      rxByPt: new Map(),
+      txPackets: 0,
+      txBytes: 0,
     });
     this.hooks.log("info", "ari leg bridged", { callId, exten });
     // Audible-silence watchdog: if Asterisk never streams, say so plainly
@@ -379,9 +387,12 @@ export class AriController {
     const peer = leg ? this.peers.get(leg.rtpPort) : undefined;
     if (!leg || !peer) return;
     const FRAME = 320; // 20 ms @ 16 kHz
-    let first = true;
     for (let i = 0; i < pcm16.length; i += FRAME) {
       if (!this.legs.has(channelId)) return; // hung up mid-reply
+      if (leg) {
+        leg.txPackets += 1;
+        leg.txBytes += pcm16.subarray(i, i + FRAME).length * 2;
+      }
       const chunk = pcm16.subarray(i, i + FRAME);
       const packet = Buffer.alloc(12 + chunk.length * 2);
       packet[0] = 0x80;
@@ -424,6 +435,10 @@ export class AriController {
       callId: leg.callId,
       rxPackets: leg.rxPackets,
       rxBytes: leg.rxBytes,
+      rxByPt: [...leg.rxByPt.entries()].map(([pt, n]) => `${pt}:${n}`).join(","),
+      txPackets: leg.txPackets,
+      txBytes: leg.txBytes,
+      replyPt: this.peers.get(leg.rtpPort)?.pt,
     });
     this.legs.delete(channelId);
     this.peers.delete(leg.rtpPort);
