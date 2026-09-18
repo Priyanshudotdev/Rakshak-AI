@@ -9,8 +9,28 @@
 // Needs DATABASE_URL in env (load from /opt/rakshak/api.env):
 //   set -a; . /opt/rakshak/api.env; set +a
 import { createInterface } from "node:readline";
+import { readFileSync } from "node:fs";
 import { hashPassword } from "../apps/api/dist/auth.js";
 import { createOperator, findOperatorByName, updatePasswordHash } from "../apps/api/dist/pgstore.js";
+
+// Shell sourcing (. /opt/rakshak/api.env) silently yields nothing in some
+// sudo contexts, so load the file directly — no shell, no quoting pitfalls.
+function loadEnvFile(path) {
+  let text;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return;
+  }
+  for (const line of text.split("\n")) {
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z_0-9]*)=(.*)$/);
+    if (!m) continue;
+    let v = m[2].trim();
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    if (!(m[1] in process.env)) process.env[m[1]] = v;
+  }
+}
+if (!process.env.DATABASE_URL) loadEnvFile("/opt/rakshak/api.env");
 
 const name = process.argv[2];
 const makeAdmin = process.argv.includes("--admin");
