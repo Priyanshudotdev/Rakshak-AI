@@ -1,0 +1,76 @@
+# deploy-voice — ship apps/api + voice services to the voice box and run them.
+#
+# Trigger: pushes to feat/v2-architecture touching the voice tree or this file.
+# Ships via `git archive` (tracked files only — .env/node_modules/data never
+# leave the laptop), then runs voice-setup.sh as root (idempotent: node,
+# npm ci, workspace builds, env files, systemd, health checks).
+#
+# Required GitHub Secrets (repo Settings -> Secrets and variables -> Actions):
+#   VPS_HOST, VPS_USER, VPS_SSH_KEY (same three as deploy-asterisk)
+#   SARVAM_API_KEY  (copy value from local .env into the secret — never chat)
+#   GEMINI_API_KEY  (same)
+#   DATABASE_URL    (same — Neon URL)
+name: deploy-voice
+
+on:
+  push:
+    branches: [feat/v2-architecture]
+    paths:
+      - apps/api/**
+      - services/media-gateway/**
+      - services/ai-engine/**
+      - packages/**
+      - infrastructure/vps/voice-setup.sh
+      - infrastructure/vps/rakshak-*.service
+      - .github/workflows/deploy-voice.yml
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ship voice tree to VPS
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          set -Eeuo pipefail
+
+          test -n "$VPS_HOST" || { echo "::error::VPS_HOST is empty"; exit 1; }
+          test -n "$VPS_USER" || { echo "::error::VPS_USER is empty"; exit 1; }
+          test -n "$VPS_SSH_KEY" || { echo "::error::VPS_SSH_KEY is empty"; exit 1; }
+
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$VPS_SSH_KEY" > "$HOME/.ssh/vps.key"
+          chmod 600 "$HOME/.ssh/vps.key"
+
+          echo "Checking SSH connectivity to $VPS_HOST"
+          if ! ssh-keyscan -T 10 -H "$VPS_HOST" >> "$HOME/.ssh/known_hosts"; then
+            echo "::error::Unable to retrieve the SSH host key from $VPS_HOST:22"
+            exit 1
+          fi
+
+          git archive HEAD apps services packages infrastructure package.json package-lock.json tsconfig.base.json |
+            ssh -i "$HOME/.ssh/vps.key" \
+              -o BatchMode=yes \
+              -o ConnectTimeout=15 \
+              -o StrictHostKeyChecking=yes \
+              "$VPS_USER@$VPS_HOST" \
+              'rm -rf /tmp/voice-deploy && mkdir -p /tmp/voice-deploy && tar -x -C /tmp/voice-deploy'
+
+      - name: Install + verify voice stack
+        uses: appleboy/ssh-action@v0.1.10
+        env:
+          SARVAM_API_KEY: ${{ secrets.SARVAM_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          envs: SARVAM_API_KEY,GEMINI_API_KEY,DATABASE_URL
+          script: sudo -E bash /tmp/voice-deploy/infrastructure/vps/voice-setup.sh

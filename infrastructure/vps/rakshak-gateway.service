@@ -1,0 +1,14 @@
+[Unit]
+Description=Rakshak media-gateway (voice box)
+After=network.target asterisk.service rakshak-api.service
+
+[Service]
+User=asterisk
+WorkingDirectory=/opt/rakshak/src
+EnvironmentFile=/opt/rakshak/gateway.env
+ExecStart=/usr/bin/node services/media-gateway/dist/index.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

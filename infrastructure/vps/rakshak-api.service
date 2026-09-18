@@ -1,0 +1,14 @@
+[Unit]
+Description=Rakshak API (voice box)
+After=network.target
+
+[Service]
+User=asterisk
+WorkingDirectory=/opt/rakshak/src
+EnvironmentFile=/opt/rakshak/api.env
+ExecStart=/usr/bin/node apps/api/dist/index.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
