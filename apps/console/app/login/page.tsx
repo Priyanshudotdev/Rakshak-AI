@@ -69,7 +69,10 @@ function LoginForm() {
             setFailure({ kind: "taken" });
             return;
           }
-          if (status === 403) {
+          if (status === 401 || status === 403) {
+            // 401: operators already exist, so registration needs an admin
+            // session. 403: signed-in but not admin. Either way this device
+            // cannot self-register — misleading "credentials" text would lie.
             setFailure({ kind: "closed" });
             return;
           }
