@@ -20,6 +20,7 @@ on:
       - services/media-gateway/**
       - services/ai-engine/**
       - packages/**
+      - database/**
       - scripts/**
       - infrastructure/vps/voice-setup.sh
       - infrastructure/vps/rakshak-*.service
@@ -61,7 +62,7 @@ jobs:
             exit 1
           fi
 
-          git archive HEAD apps services packages infrastructure scripts package.json package-lock.json tsconfig.base.json |
+          git archive HEAD apps services packages infrastructure database scripts package.json package-lock.json tsconfig.base.json |
             ssh -i "$HOME/.ssh/vps.key" \
               -o BatchMode=yes \
               -o ConnectTimeout=15 \
