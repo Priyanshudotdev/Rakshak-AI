@@ -1,0 +1,5 @@
+# Keep Unix line endings for files that run on Linux (prevents ^M breakage).
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.conf text eol=lf

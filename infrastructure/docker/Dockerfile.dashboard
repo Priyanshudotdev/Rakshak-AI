@@ -1,0 +1,25 @@
+# Dashboard image: Next.js operator console.
+# NOTE: NEXT_PUBLIC_API_URL is inlined at build time (Next.js public env).
+# Set it to the URL *browsers* use to reach the API (default localhost:3001).
+ARG NEXT_PUBLIC_API_URL=http://localhost:3001
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY apps/dashboard/package.json ./apps/dashboard/
+RUN npm ci --no-audit --no-fund
+
+FROM deps AS build
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+COPY tsconfig.base.json ./
+COPY apps/dashboard ./apps/dashboard
+RUN npm run build --workspace @rakshak/dashboard
+
+FROM node:20-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+ENV PORT=3000
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps /app/package.json ./package.json
+COPY --from=build /app/apps/dashboard ./apps/dashboard
+EXPOSE 3000
+CMD ["node", "node_modules/next/dist/bin/next", "start", "apps/dashboard", "-p", "3000"]

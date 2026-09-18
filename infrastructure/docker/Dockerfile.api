@@ -1,0 +1,47 @@
+# API image: Fastify REST + event bus + Postgres/file backends.
+# No `|| true` masking — a failed install or build must fail the image.
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json tsconfig.base.json ./
+COPY apps/api/package.json ./apps/api/
+COPY services/ai-engine/package.json ./services/ai-engine/
+COPY packages/types/package.json ./packages/types/
+COPY packages/events/package.json ./packages/events/
+COPY packages/config/package.json ./packages/config/
+COPY packages/logger/package.json ./packages/logger/
+COPY packages/types/tsconfig.json ./packages/types/
+COPY packages/events/tsconfig.json ./packages/events/
+COPY packages/config/tsconfig.json ./packages/config/
+COPY packages/logger/tsconfig.json ./packages/logger/
+COPY services/ai-engine/tsconfig.json ./services/ai-engine/
+COPY apps/api/tsconfig.json ./apps/api/
+RUN npm ci --no-audit --no-fund
+
+FROM deps AS build
+COPY packages/types/src ./packages/types/src
+COPY packages/events/src ./packages/events/src
+COPY packages/config/src ./packages/config/src
+COPY packages/logger/src ./packages/logger/src
+COPY services/ai-engine/src ./services/ai-engine/src
+COPY apps/api/src ./apps/api/src
+COPY database ./database
+RUN npm run build --workspace @rakshak/types \
+ && npm run build --workspace @rakshak/config \
+ && npm run build --workspace @rakshak/logger \
+ && npm run build --workspace @rakshak/events \
+ && npm run build --workspace @rakshak/ai-engine \
+ && npm run build --workspace @rakshak/api
+
+FROM node:20-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps /app/package.json ./package.json
+COPY --from=build /app/apps/api/dist ./apps/api/dist
+COPY --from=build /app/apps/api/package.json ./apps/api/package.json
+COPY --from=build /app/services/ai-engine/dist ./services/ai-engine/dist
+COPY --from=build /app/services/ai-engine/package.json ./services/ai-engine/package.json
+COPY --from=build /app/packages ./packages
+COPY --from=build /app/database ./database
+EXPOSE 3001
+CMD ["node", "apps/api/dist/index.js"]

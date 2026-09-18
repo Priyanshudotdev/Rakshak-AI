@@ -1,0 +1,26 @@
+{
+  "name": "@rakshak/media-gateway",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@rakshak/config": "2.0.0",
+    "@rakshak/events": "2.0.0",
+    "@rakshak/logger": "2.0.0",
+    "@rakshak/types": "2.0.0",
+    "@types/node": "^22.20.3",
+    "@types/ws": "^8.18.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^5.0.1"
+  }
+}
