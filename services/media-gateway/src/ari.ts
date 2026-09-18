@@ -2,6 +2,12 @@ import { createSocket, type Socket as UdpSocket } from "node:dgram";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { RealtimeAdapter, RealtimeSession } from "./saaras.js";
+import {
+  buildFinalPayload,
+  buildPartialPayload,
+  isPublishableText,
+  PartialThrottle,
+} from "./transcripts.js";
 
 // ARI call control (spec §6): answer Stasis calls, fork caller audio to the
 // realtime adapter via one External Media channel per call, bridge, cleanup.
@@ -227,6 +233,9 @@ export class AriController {
   private readonly operatorProfiles = new Map<string, OperatorProfile>();
   /** Waiting-room poll timers: operator channelId -> timeout. */
   private readonly waitingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Partial throttle: one transcript.partial per call per 200 ms (~5/s) so a
+   *  chatty STT never melts the dashboard. Finals bypass it (rare + must land). */
+  private readonly partialThrottle = new PartialThrottle();
 
   constructor(hooks: AriHooks, opts: AriOptions = {}) {
     this.hooks = hooks;
@@ -683,10 +692,20 @@ export class AriController {
   ): Promise<{ udp: UdpSocket; saaras: RealtimeSession; rtpPort: number; externalId: string; snoopId: string; tapBridgeId: string }> {
     let evCount = 0;
     const saaras = await this.hooks.adapter.connect(callId, {
-      onPartial: (text, language) =>
-        this.hooks.publish("transcript.partial", callId, { original_text: text, language: language ?? "Unknown", role }),
+      onPartial: (text, language) => {
+        // Contract: original_text always a string, language falls back to
+        // "Unknown", role tags the leg, callId is this leg's call. Blank
+        // frames never publish; faster-than-5/s frames coalesce.
+        if (!isPublishableText(text)) return;
+        if (!this.partialThrottle.shouldSend(callId)) return;
+        this.hooks.publish("transcript.partial", callId, buildPartialPayload(text, language, role));
+      },
       onFinal: (text, language, confidence) => {
-        this.hooks.publish("transcript.final", callId, { original_text: text, language: language ?? "Unknown", role, confidence });
+        if (!isPublishableText(text)) return;
+        // Finals always land (no throttle) and re-arm the partial window so
+        // the next partial after a final is immediate, not swallowed.
+        this.partialThrottle.reset(callId);
+        this.hooks.publish("transcript.final", callId, buildFinalPayload(text, language, role, confidence));
         try {
           this.hooks.onFinalTranscript?.(callId, text, language, role, confidence);
         } catch (err) {

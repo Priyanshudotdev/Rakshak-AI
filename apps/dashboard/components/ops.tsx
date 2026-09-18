@@ -8,11 +8,13 @@ import {
   clearRecords,
   deleteRecord,
   getAnalytics,
+  getAuditLog,
   getDispatchLog,
   getHealth,
   getProfile,
   getRecordCount,
   getTranslation,
+  isAuthError,
   listRecords,
   login,
   logout,
@@ -27,6 +29,7 @@ import {
   signedInOperator,
   synthesize,
   translate,
+  type AuditEntry,
   type ListenVoice,
 } from "../lib/api";
 import type { LiveEvent } from "../lib/live";
@@ -57,7 +60,46 @@ const invalidateAll = (qc: ReturnType<typeof useQueryClient>) =>
     qc.invalidateQueries({ queryKey: ["count"] }),
     qc.invalidateQueries({ queryKey: ["analytics"] }),
     qc.invalidateQueries({ queryKey: ["dispatch"] }),
+    qc.invalidateQueries({ queryKey: ["audit"] }),
   ]);
+
+/* ---------------- Shared honest-state helpers ---------------- */
+
+/** Human message for a query/mutation failure. 401s become sign-in guidance. */
+function errorMessage(e: unknown, fallback = "Request failed — check the API and retry."): string {
+  if (isAuthError(e)) return "Sign in required — sign in as an operator to continue.";
+  if (e instanceof Error && e.message) return e.message;
+  return fallback;
+}
+
+function StaleHint({ onRetry }: { onRetry?: () => void }) {
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <Badge tone="warn">stale</Badge>
+      {onRetry ? (
+        <button
+          type="button"
+          onClick={onRetry}
+          className="text-xs text-accentlight hover:underline"
+          aria-label="Retry"
+        >
+          Retry
+        </button>
+      ) : null}
+    </span>
+  );
+}
+
+function RetryError({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <div className="space-y-2">
+      <Alert kind="error">{message}</Alert>
+      <Button variant="ghost" onClick={onRetry}>
+        Retry
+      </Button>
+    </div>
+  );
+}
 
 /* ---------------- Navigation (sidebar + topbar) ---------------- */
 
@@ -182,9 +224,23 @@ function SidebarNav({
   );
 }
 
-function Topbar({ section, count, onMenu }: { section: Section; count?: number; onMenu: () => void }) {
+export function Topbar({
+  section,
+  count,
+  countError,
+  onMenu,
+}: {
+  section: Section;
+  count?: number;
+  countError?: boolean;
+  onMenu: () => void;
+}) {
   const health = useQuery({ queryKey: ["health"], queryFn: getHealth, refetchInterval: 10_000, placeholderData: keepPreviousData });
   const meta = SECTION_META[section];
+  const loading = health.isPending && !health.data;
+  const offline = health.isError && !health.data;
+  const stale = health.isError && !!health.data;
+  const apiOk = health.data?.status === "ok";
   return (
     <header className="sticky top-0 z-10 border-b border-line bg-ink/95 backdrop-blur">
       <div className="mx-auto flex max-w-[1400px] flex-wrap items-center gap-3 px-4 py-3">
@@ -202,14 +258,56 @@ function Topbar({ section, count, onMenu }: { section: Section; count?: number; 
           <h1 className="truncate font-serif text-[22px] font-medium leading-[120%] tracking-[-0.01em] text-cream">{meta.title}</h1>
           <p className="truncate text-[13px] leading-[145%] text-muted">{meta.sub}</p>
         </div>
-        <div className="ml-auto flex items-center gap-2">
-          <Badge tone={health.data?.status === "ok" ? "ok" : "bad"}>
-            <span className={`inline-block h-1.5 w-1.5 rounded-full ${health.data?.status === "ok" ? "bg-priolow" : "bg-priohigh"}`} />
-            API {health.data?.status ?? "…"}
-          </Badge>
-          <Badge tone="neutral">STT {health.data?.sarvam ? "on" : "off"}</Badge>
-          <Badge tone="neutral">LLM {health.data?.gemini ? "on" : "rules"}</Badge>
-          <Badge tone="info">records {count ?? "…"}</Badge>
+        <div className="ml-auto flex flex-wrap items-center gap-2" data-testid="health-badges">
+          {loading ? (
+            <Badge tone="neutral">
+              <span className="inline-block h-1.5 w-1.5 rounded-full bg-muted" />
+              API …
+            </Badge>
+          ) : offline ? (
+            <span data-testid="health-offline">
+              <Badge tone="bad">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-priohigh" />
+                API offline
+              </Badge>
+            </span>
+          ) : (
+            <Badge tone={apiOk ? "ok" : "bad"}>
+              <span className={`inline-block h-1.5 w-1.5 rounded-full ${apiOk ? "bg-priolow" : "bg-priohigh"}`} />
+              API {health.data?.status ?? "unknown"}
+              {stale ? " · stale" : ""}
+            </Badge>
+          )}
+          {loading ? (
+            <Badge tone="neutral">STT …</Badge>
+          ) : offline ? (
+            <Badge tone="neutral">STT offline</Badge>
+          ) : (
+            <Badge tone="neutral">
+              STT {health.data?.sarvam ? "on" : "off"}
+              {stale ? " · stale" : ""}
+            </Badge>
+          )}
+          {loading ? (
+            <Badge tone="neutral">LLM …</Badge>
+          ) : offline ? (
+            <Badge tone="neutral">LLM offline</Badge>
+          ) : (
+            <Badge tone="neutral">
+              LLM {health.data?.gemini ? "on" : "rules"}
+              {stale ? " · stale" : ""}
+            </Badge>
+          )}
+          {count !== undefined ? (
+            <Badge tone="info">
+              records {count}
+              {countError ? " · stale" : ""}
+            </Badge>
+          ) : countError ? (
+            <Badge tone="bad">records offline</Badge>
+          ) : (
+            <Badge tone="info">records …</Badge>
+          )}
         </div>
       </div>
     </header>
@@ -314,17 +412,18 @@ function IntakePanel({ onDone }: { onDone: (id: string) => void }) {
 
 /* ---------------- Analytics strip ---------------- */
 
-function AnalyticsStrip() {
+export function AnalyticsStrip() {
   // keepPreviousData: background refetches/errors keep stale stats on screen.
   // Without it every 5s poll (or transient API error) swaps stats for
   // skeletons and back — the reported "blinking". Skeletons show on first
   // load only now. Interval raised: WS invalidation covers live updates.
-  const { data } = useQuery({
+  const query = useQuery({
     queryKey: ["analytics"],
     queryFn: async () => (await getAnalytics()).data,
     refetchInterval: 15_000,
     placeholderData: keepPreviousData,
   });
+  const { data } = query;
   const stats: Array<[string, string]> = data
     ? [
         ["Incidents", String(data.total_records)],
@@ -335,18 +434,40 @@ function AnalyticsStrip() {
         ["Avg STT", `${data.average_latencies?.speech_ms ?? 0} ms`],
       ]
     : [];
+  if (query.isPending) {
+    return (
+      <div className="grid min-h-[68px] grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
+        {Array.from({ length: 6 }).map((_, i) => (
+          <div key={i} className="h-[68px] rounded-lg2 border border-line bg-surface" />
+        ))}
+      </div>
+    );
+  }
+  if (query.isError && !data) {
+    return (
+      <Card>
+        <CardBody>
+          <RetryError message={errorMessage(query.error)} onRetry={() => void query.refetch()} />
+        </CardBody>
+      </Card>
+    );
+  }
   return (
-    <div className="grid min-h-[68px] grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
-      {!data
-        ? Array.from({ length: 6 }).map((_, i) => (
-            <div key={i} className="h-[68px] rounded-lg2 border border-line bg-surface" />
-          ))
-        : stats.map(([k, v]) => (
-            <div key={k} className="rounded-lg2 border border-line bg-surface px-4 py-3">
-              <p className="font-mono text-xl font-semibold text-white">{v}</p>
-              <p className="mt-0.5 text-xs uppercase tracking-wider text-muted">{k}</p>
-            </div>
-          ))}
+    <div>
+      {query.isError && data ? (
+        <p className="mb-2 flex items-center gap-2 text-xs text-muted">
+          <StaleHint onRetry={() => void query.refetch()} />
+          <span>Showing last good stats — {errorMessage(query.error)}</span>
+        </p>
+      ) : null}
+      <div className="grid min-h-[68px] grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
+        {stats.map(([k, v]) => (
+          <div key={k} className="rounded-lg2 border border-line bg-surface px-4 py-3">
+            <p className="font-mono text-xl font-semibold text-white">{v}</p>
+            <p className="mt-0.5 text-xs uppercase tracking-wider text-muted">{k}</p>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -390,12 +511,19 @@ export function RecordsPanel({
     },
   });
 
+  const hasData = !!records.data;
+  const isEmpty = hasData && (records.data?.length ?? 0) === 0 && !records.isError;
   return (
     <Card className="flex min-h-[420px] flex-col">
       <CardHead
         title="Incident records"
         sub="Live list · audio streams on demand, never inline"
-        right={<Badge tone="info">{records.data?.length ?? "…"} shown</Badge>}
+        right={
+          <span className="inline-flex items-center gap-1.5">
+            <Badge tone="info">{records.data?.length ?? "…"} shown</Badge>
+            {records.isError && hasData ? <StaleHint onRetry={() => void records.refetch()} /> : null}
+          </span>
+        }
       />
       <CardBody>
         <div className="mb-3 grid grid-cols-1 gap-2 sm:grid-cols-[1fr_130px]">
@@ -408,11 +536,16 @@ export function RecordsPanel({
             ))}
           </SelectInput>
         </div>
+        {records.isError && hasData ? (
+          <p className="mb-2 text-xs text-muted">Showing last good list — {errorMessage(records.error)}</p>
+        ) : null}
         {records.isPending ? (
           <div className="flex items-center gap-2 text-sm text-muted">
             <Spinner /> Loading records…
           </div>
-        ) : !records.data?.length ? (
+        ) : records.isError && !hasData ? (
+          <RetryError message={errorMessage(records.error)} onRetry={() => void records.refetch()} />
+        ) : isEmpty ? (
           <EmptyState title="No incidents yet" sub="Analyze a transcript or upload audio to create the first record." />
         ) : (
           <ul className="max-h-[560px] space-y-2 overflow-y-auto pr-1">
@@ -446,7 +579,8 @@ export function RecordsPanel({
           </ul>
         )}
         {isAdmin ? (
-          <div className="mt-3">
+          <div className="mt-3 space-y-2">
+            {clearAll.isError ? <Alert kind="error">{errorMessage(clearAll.error)}</Alert> : null}
             {!confirmingClear ? (
               <Button variant="danger" onClick={() => setConfirmingClear(true)}>
                 Clear all records
@@ -711,6 +845,12 @@ export function RecordDetail({ record, events }: { record: IncidentRecord | null
               </Button>
             </div>
           </form>
+          {dispatch.isError ? (
+            <div className="mt-2">
+              <Alert kind="error">{errorMessage(dispatch.error)}</Alert>
+            </div>
+          ) : null}
+          {dispatch.isSuccess ? <div className="mt-2"><Alert kind="ok">Dispatch logged.</Alert></div> : null}
           {record.timings && Object.keys(record.timings).length > 0 ? (
             <p className="mt-3 font-mono text-[11px] text-muted">
               {Object.entries(record.timings)
@@ -718,7 +858,8 @@ export function RecordDetail({ record, events }: { record: IncidentRecord | null
                 .join(" · ")}
             </p>
           ) : null}
-          <div className="mt-3">
+          <div className="mt-3 space-y-2">
+            {del.isError ? <Alert kind="error">{errorMessage(del.error)}</Alert> : null}
             {!isAdmin ? null : !confirming ? (
               <Button variant="danger" onClick={() => setConfirming(true)}>
                 Delete record
@@ -821,8 +962,8 @@ function OperatorListen({ feed }: { feed: { events: LiveEvent[] } }) {
                   setBusy(false);
                   audioRef.current?.play().catch(() => undefined);
                 })
-                .catch((e: Error) => {
-                  setError(e.message || "Translation failed");
+                .catch((e: unknown) => {
+                  setError(errorMessage(e, "Translation failed"));
                   setBusy(false);
                 });
             }}
@@ -886,6 +1027,7 @@ export function OperatorProfile() {
     queryFn: getProfile,
     enabled: !!session,
     refetchOnWindowFocus: false,
+    placeholderData: keepPreviousData,
   });
   const [known, setKnown] = useState<string[]>([]);
   const [defaultLang, setDefaultLang] = useState<string>("mr-IN");
@@ -920,6 +1062,8 @@ export function OperatorProfile() {
   const toggleLang = (code: string) =>
     setKnown((prev) => (prev.includes(code) ? prev.filter((l) => l !== code) : [...prev, code]));
 
+  const failedNoData = profile.isError && !profile.data;
+  const showForm = !!profile.data || (!profile.isPending && !failedNoData);
   return (
     <Card>
       <CardHead
@@ -932,10 +1076,16 @@ export function OperatorProfile() {
           <div className="flex items-center gap-2 text-sm text-muted">
             <Spinner /> Loading profile…
           </div>
-        ) : profile.isError ? (
-          <Alert kind="error">Couldn&apos;t load profile — check the API and retry.</Alert>
-        ) : (
+        ) : failedNoData ? (
+          <RetryError message={errorMessage(profile.error)} onRetry={() => void profile.refetch()} />
+        ) : showForm ? (
           <div className="space-y-3">
+            {profile.isError && profile.data ? (
+              <p className="flex items-center gap-2 text-xs text-muted">
+                <StaleHint onRetry={() => void profile.refetch()} />
+                <span>Showing last good profile — {errorMessage(profile.error)}</span>
+              </p>
+            ) : null}
             <Field label="Known languages">
               <div className="flex flex-wrap gap-1.5">
                 {PROFILE_LANGUAGES.map((code) => {
@@ -977,15 +1127,13 @@ export function OperatorProfile() {
                 aria-label="Mobile (E164)"
               />
             </Field>
-            {save.isError ? (
-              <Alert kind="error">{save.error instanceof Error ? save.error.message : "Save failed."}</Alert>
-            ) : null}
+            {save.isError ? <Alert kind="error">{errorMessage(save.error, "Save failed.")}</Alert> : null}
             {save.isSuccess ? <Alert kind="ok">Profile saved.</Alert> : null}
             <Button disabled={save.isPending} onClick={() => save.mutate()} className="w-full">
               {save.isPending ? <Spinner /> : null} Save profile
             </Button>
           </div>
-        )}
+        ) : null}
       </CardBody>
     </Card>
   );
@@ -1070,24 +1218,35 @@ export function LiveTranslationPanel({ feed }: { feed: { events: LiveEvent[] } }
       setOptimistic(null);
     } catch (e) {
       setOptimistic(prev);
-      setError(e instanceof Error ? e.message : "Translation update failed");
+      setError(errorMessage(e, "Translation update failed"));
     } finally {
       setPending(false);
     }
   };
 
+  const queryFailedNoData = !!callId && state.isError && !state.data && optimistic === null;
   return (
     <Card>
       <CardHead
         title="Live translation"
         sub={callId ? `Per-call toggle · ${callId}` : "Waiting for a live call"}
-        right={<Badge tone={enabled ? "ok" : "neutral"}>{enabled ? "on" : "off"}</Badge>}
+        right={
+          <span className="inline-flex items-center gap-1.5">
+            <Badge tone={enabled ? "ok" : "neutral"}>{enabled ? "on" : "off"}</Badge>
+            {callId && state.isError && state.data ? <StaleHint onRetry={() => void state.refetch()} /> : null}
+          </span>
+        }
       />
       <CardBody>
         {!callId ? (
           <EmptyState title="No live call" sub="Latest transcript.final sets the active call for translation." />
+        ) : queryFailedNoData ? (
+          <RetryError message={errorMessage(state.error)} onRetry={() => void state.refetch()} />
         ) : (
           <>
+            {callId && state.isError && state.data ? (
+              <p className="mb-2 text-xs text-muted">Showing last good toggle — {errorMessage(state.error)}</p>
+            ) : null}
             <div className="flex flex-wrap items-center gap-2">
               <TranslationToggle enabled={enabled} pending={pending || state.isPending} onToggle={() => void flip()} />
               <span className="font-mono text-xs text-muted">{callId}</span>
@@ -1109,13 +1268,14 @@ export function LiveTranslationPanel({ feed }: { feed: { events: LiveEvent[] } }
 
 /* ---------------- Dispatch log ---------------- */
 
-function DispatchPanel() {
-  const { data, isPending } = useQuery({
+export function DispatchPanel() {
+  const query = useQuery({
     queryKey: ["dispatch"],
     queryFn: getDispatchLog,
     refetchInterval: 15_000,
     placeholderData: keepPreviousData,
   });
+  const { data, isPending } = query;
   const log: DispatchEntry[] = Array.isArray(data) ? data : [];
   const [callsign, setCallsign] = useState(operatorName());
   const [session, setSession] = useState(signedInOperator());
@@ -1123,7 +1283,16 @@ function DispatchPanel() {
   const [authError, setAuthError] = useState<string | null>(null);
   return (
     <Card>
-      <CardHead title="Dispatch log" sub="Operator decisions — auditable" right={<Badge tone="info">{log.length}</Badge>} />
+      <CardHead
+        title="Dispatch log"
+        sub="Operator decisions — auditable"
+        right={
+          <span className="inline-flex items-center gap-1.5">
+            <Badge tone="info">{query.data ? log.length : "…"}</Badge>
+            {query.isError && query.data ? <StaleHint onRetry={() => void query.refetch()} /> : null}
+          </span>
+        }
+      />
       <CardBody>
         {session ? (
           <p className="mb-2 flex items-center justify-between gap-2 text-xs text-muted">
@@ -1193,10 +1362,15 @@ function DispatchPanel() {
             {authError ? <p className="text-xs text-red-400">{authError}</p> : null}
           </div>
         )}
+        {query.isError && query.data ? (
+          <p className="mb-2 text-xs text-muted">Showing last good log — {errorMessage(query.error)}</p>
+        ) : null}
         {isPending ? (
           <div className="flex items-center gap-2 text-sm text-muted">
             <Spinner /> Loading…
           </div>
+        ) : query.isError && !query.data ? (
+          <RetryError message={errorMessage(query.error)} onRetry={() => void query.refetch()} />
         ) : !log.length ? (
           <EmptyState title="No dispatches logged" sub="Decisions from the record panel appear here." />
         ) : (
@@ -1212,6 +1386,64 @@ function DispatchPanel() {
                 </p>
                 <p className="text-muted">
                   {d.call_id ?? ""} · {d.units ?? ""}{d.operator ? ` · ${d.operator}` : ""}
+                </p>
+              </li>
+            ))}
+          </ul>
+        )}
+      </CardBody>
+    </Card>
+  );
+}
+
+/* ---------------- Audit trail ---------------- */
+
+export function AuditPanel() {
+  const query = useQuery({
+    queryKey: ["audit"],
+    queryFn: async () => (await getAuditLog(50)).data as AuditEntry[],
+    refetchInterval: 15_000,
+    placeholderData: keepPreviousData,
+  });
+  const entries = query.data ?? [];
+  return (
+    <Card>
+      <CardHead
+        title="Audit trail"
+        sub="Newest first · operator actions"
+        right={
+          <span className="inline-flex items-center gap-1.5">
+            <Badge tone="info">{query.data ? entries.length : "…"}</Badge>
+            {query.isError && query.data ? <StaleHint onRetry={() => void query.refetch()} /> : null}
+          </span>
+        }
+      />
+      <CardBody>
+        {query.isError && query.data ? (
+          <p className="mb-2 text-xs text-muted">Showing last good trail — {errorMessage(query.error)}</p>
+        ) : null}
+        {query.isPending ? (
+          <div className="flex items-center gap-2 text-sm text-muted">
+            <Spinner /> Loading audit trail…
+          </div>
+        ) : query.isError && !query.data ? (
+          <RetryError message={errorMessage(query.error)} onRetry={() => void query.refetch()} />
+        ) : !entries.length ? (
+          <EmptyState title="No audit entries yet" sub="Operator sign-ins, dispatches and deletes appear here." />
+        ) : (
+          <ul className="max-h-[300px] space-y-2 overflow-y-auto pr-1">
+            {entries.slice(0, 20).map((a, i) => (
+              <li key={String(a.id ?? i)} className="rounded-md2 border border-line bg-ink p-2.5 text-xs">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-medium text-cream">{a.action ?? "action"}</span>
+                  <span className="shrink-0 font-mono text-muted">
+                    {(a.created_at ?? a.at ?? "").slice(0, 19).replace("T", " ")}
+                  </span>
+                </div>
+                <p className="mt-0.5 text-muted">
+                  {a.actor ? `by ${a.actor}` : "by operator"}
+                  {a.entity ? ` · ${a.entity}` : ""}
+                  {a.entity_id ? ` ${a.entity_id}` : ""}
                 </p>
               </li>
             ))}
@@ -1260,7 +1492,7 @@ export function OpsConsole() {
         </div>
       ) : null}
       <div className="min-w-0 flex-1">
-        <Topbar section={section} count={count.data} onMenu={() => setNavOpen(true)} />
+        <Topbar section={section} count={count.data} countError={count.isError} onMenu={() => setNavOpen(true)} />
         <main className="mx-auto max-w-[1400px] space-y-4 px-4 py-4">
           {section === "home" ? (
             <>
@@ -1282,17 +1514,28 @@ export function OpsConsole() {
             <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
               <RecordsPanel selectedId={selectedId} onSelect={(id) => setSelectedId(id)} />
               <Card className="min-h-[420px]">
-                <CardHead title="Incident workspace" sub="Evidence · reasoning · actions" />
+                <CardHead
+                  title="Incident workspace"
+                  sub="Evidence · reasoning · actions"
+                  right={records.isError && records.data ? <StaleHint onRetry={() => void records.refetch()} /> : null}
+                />
                 <CardBody>
-                  <RecordDetail record={selected} events={feed.events} />
+                  {records.isError && !records.data ? (
+                    <RetryError message={errorMessage(records.error)} onRetry={() => void records.refetch()} />
+                  ) : (
+                    <RecordDetail record={selected} events={feed.events} />
+                  )}
                 </CardBody>
               </Card>
             </div>
           ) : null}
           {section === "operators" ? (
-            <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-              <OperatorProfile />
-              <DispatchPanel />
+            <div className="space-y-4">
+              <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+                <OperatorProfile />
+                <DispatchPanel />
+              </div>
+              <AuditPanel />
             </div>
           ) : null}
           <footer className="pb-6 pt-2 text-center text-xs text-muted">

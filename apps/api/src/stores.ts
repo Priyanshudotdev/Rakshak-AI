@@ -22,3 +22,14 @@ export async function stores(): Promise<Backend> {
 export function backendNameSync(): string {
   return backendName;
 }
+
+/** Test seam: forget the cached backend so the next stores() re-probes. */
+export function resetStoresForTests(): void {
+  backend = null;
+  backendName = "file";
+}
+
+/** Test seam: force the readiness banner (file|postgres) without probing. */
+export function setBackendNameForTests(name: string): void {
+  backendName = name;
+}

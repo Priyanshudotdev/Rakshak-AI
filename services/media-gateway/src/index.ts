@@ -4,6 +4,12 @@ import { SessionManager } from "./session.js";
 import { AriController } from "./ari.js";
 import { createConversation } from "./conversation.js";
 import { createAdapter } from "./saaras.js";
+import {
+  buildFinalPayload,
+  buildPartialPayload,
+  isPublishableText,
+  PartialThrottle,
+} from "./transcripts.js";
 
 // Media Gateway (spec §7): Asterisk media <-> Sarvam STT transport + session mgmt.
 // Replay/file mode (current): WS audio intake -> session buffer -> API batch endpoint.
@@ -25,6 +31,10 @@ const MAX_SESSIONS = Number(process.env.MAX_SESSIONS ?? 200);
 
 const sessions = new SessionManager(MAX_SESSIONS);
 const adapter = createAdapter();
+// Replay-path partial throttle: one transcript.partial per call per 200 ms
+// (~5/s). WS clients can otherwise forward per-packet frames and melt the UI;
+// intermediate frames coalesce and the next window carries the latest text.
+const partialThrottle = new PartialThrottle();
 
 function log(level: string, msg: string, fields: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ level, msg, at: new Date().toISOString(), ...fields }));
@@ -61,9 +71,15 @@ async function finalize(callId: string, filename?: string): Promise<void> {
       return;
     }
     const body = (await res.json()) as { data?: { transcript_original?: string; original_language?: string; id?: string } };
+    // Batch finalize is always the caller leg: role=caller keeps the dashboard
+    // contract (original_text never undefined, language fallback, role tagged).
+    partialThrottle.reset(callId);
     await publish("transcript.final", callId, {
-      original_text: body.data?.transcript_original ?? "",
-      language: body.data?.original_language ?? "Unknown",
+      ...buildFinalPayload(
+        body.data?.transcript_original ?? "",
+        body.data?.original_language ?? "Unknown",
+        "caller",
+      ),
       record_id: body.data?.id,
     });
   } catch (err) {
@@ -101,12 +117,17 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
   }
   void publish("call.started", callId, { via: "gateway", mode: "replay" });
   // Keep one realtime adapter session per call leg for the Asterisk phase.
+  // Replay legs are caller audio: role=caller, throttled to ~5/s per call.
   void adapter.connect(callId, {
     onPartial: (text, language) => {
-      void publish("transcript.partial", callId, { original_text: text, language: language ?? "Unknown" });
+      if (!isPublishableText(text)) return;
+      if (!partialThrottle.shouldSend(callId)) return;
+      void publish("transcript.partial", callId, buildPartialPayload(text, language, "caller"));
     },
     onFinal: (text, language) => {
-      void publish("transcript.final", callId, { original_text: text, language: language ?? "Unknown" });
+      if (!isPublishableText(text)) return;
+      partialThrottle.reset(callId);
+      void publish("transcript.final", callId, buildFinalPayload(text, language, "caller"));
     },
     onError: (err) => log("warn", "realtime error", { callId, err: String(err) }),
     onClose: () => undefined,
@@ -141,12 +162,14 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
         break;
       }
       case "partial": {
-        if (typeof frame.text === "string" && frame.text) {
+        if (isPublishableText(frame.text)) {
+          if (!partialThrottle.shouldSend(callId)) break;
           sessions.markPartial(callId);
-          void publish("transcript.partial", callId, {
-            original_text: frame.text,
-            language: (frame.language as string | undefined) ?? "Unknown",
-          });
+          void publish(
+            "transcript.partial",
+            callId,
+            buildPartialPayload(frame.text, frame.language, "caller"),
+          );
         }
         break;
       }

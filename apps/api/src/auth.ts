@@ -37,17 +37,16 @@ export interface AuthHeaders {
   "x-operator"?: string | string[];
 }
 
-/** Resolve the acting operator from headers. Never throws, never leaks why. */
+/** Resolve the acting operator from headers.
+ *  Returns null for bad/missing credentials (never leaks why) but re-throws
+ *  infrastructure failures (DB down, timeout, schema unready) so callers can
+ *  answer 500 "Database unavailable" instead of masking the outage as 401. */
 export async function authenticate(store: AuthStore, headers: AuthHeaders): Promise<Doc | null> {
   const raw = headers.authorization ?? "";
   const token = raw.startsWith("Bearer ") ? raw.slice(7).trim() : "";
   if (token) {
-    try {
-      const op = await store.resolveSession(token);
-      if (op) return op;
-    } catch {
-      /* fall through to callsign */
-    }
+    const op = await store.resolveSession(token);
+    if (op) return op;
   }
   return null;
 }

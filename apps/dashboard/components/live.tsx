@@ -1,6 +1,6 @@
 "use client";
 
-import type { LiveEvent } from "../lib/live";
+import type { LiveEvent, LiveStatus } from "../lib/live";
 import { bilingualTranscripts, groupTranscriptsByCall, operatorWaitingState } from "../lib/live";
 import { Badge, Card, CardBody, CardHead, EmptyState } from "./ui";
 
@@ -20,7 +20,28 @@ export interface LiveFeed {
   connected: boolean;
   events: LiveEvent[];
   lastPartial: string | null;
+  /** Honest socket state from useLiveEvents (optional for test compat). */
+  status?: LiveStatus;
+  retryCount?: number;
+  nextRetryMs?: number | null;
 }
+
+function statusOf(feed: LiveFeed): LiveStatus {
+  if (feed.status) return feed.status;
+  return feed.connected ? "live" : "reconnecting";
+}
+
+const STATUS_TONE: Record<LiveStatus, "neutral" | "info" | "ok" | "bad"> = {
+  connecting: "info",
+  live: "ok",
+  reconnecting: "bad",
+};
+
+const STATUS_DOT: Record<LiveStatus, string> = {
+  connecting: "bg-priomed",
+  live: "bg-priolow",
+  reconnecting: "bg-priohigh",
+};
 
 /** Waiting-room banner: a policeman is holding with no live caller. Shows on
  *  `operator.waiting`, clears on `operator.joined` / `call.ended` (see
@@ -88,23 +109,31 @@ export function BilingualTranscriptList({ events }: { events: LiveEvent[] }) {
 }
 
 export function LivePanel({ feed }: { feed: LiveFeed }) {
-  const { connected, events, lastPartial } = feed;
+  const { events, lastPartial } = feed;
+  const status = statusOf(feed);
+  const retrySuffix =
+    status === "reconnecting" && (feed.retryCount ?? 0) > 0
+      ? ` · retry ${feed.retryCount}${feed.nextRetryMs != null ? ` in ${Math.ceil(feed.nextRetryMs / 1000)}s` : ""}`
+      : "";
   return (
     <Card>
       <CardHead
         title="Live wire"
         sub="WebSocket event stream · polling keeps panels fresh if it drops"
         right={
-          <Badge tone={connected ? "ok" : "bad"}>
-            <span className={`inline-block h-1.5 w-1.5 rounded-full ${connected ? "bg-priolow" : "bg-priohigh"}`} />
-            {connected ? "live" : "reconnecting"}
+          <Badge tone={STATUS_TONE[status]}>
+            <span data-testid="live-status-dot" className={`inline-block h-1.5 w-1.5 rounded-full ${STATUS_DOT[status]}`} />
+            <span data-testid="live-status">
+              {status}
+              {retrySuffix}
+            </span>
           </Badge>
         }
       />
       <CardBody>
         <WaitingRoomBanner events={events} />
         {lastPartial ? (
-          <div className="mb-3 rounded-md2 border border-priomed/40 bg-priomed/10 p-2.5">
+          <div data-testid="live-partial" className="mb-3 rounded-md2 border border-priomed/40 bg-priomed/10 p-2.5">
             <p className="mb-1 text-[11px] font-medium uppercase tracking-wider text-[#8a5a00]">Hearing now (partial)</p>
             <p className="text-sm text-cream">{lastPartial}</p>
           </div>
@@ -112,7 +141,7 @@ export function LivePanel({ feed }: { feed: LiveFeed }) {
         {!events.length ? (
           <EmptyState title="No live events yet" sub="Analyze a call or connect the media gateway to see the stream." />
         ) : (
-          <ul className="max-h-[260px] space-y-1.5 overflow-y-auto pr-1">
+          <ul data-testid="live-events" className="max-h-[260px] space-y-1.5 overflow-y-auto pr-1">
             {events.slice(0, 15).map((e, i) => (
               <li key={`${e.at}-${i}`} className="flex items-center gap-2 rounded-md2 border border-line/70 bg-ink px-2 py-1.5 text-xs">
                 <Badge tone={TONE[e.name] ?? "neutral"}>{e.name}</Badge>

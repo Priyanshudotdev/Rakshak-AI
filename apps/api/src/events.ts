@@ -160,8 +160,17 @@ export function registerEventRoutes(app: FastifyInstance): void {
   });
 
   // Latency percentiles over persisted request timings (spec §26).
-  app.get("/api/metrics/latency", async () => {
-    const records = await (await stores()).getRecords({ limit: 500 });
+  // Open read (dashboard polls); DB down -> fast 500 envelope, never hang.
+  app.get("/api/metrics/latency", async (_req, reply) => {
+    let records;
+    try {
+      records = await (await stores()).getRecords({ limit: 500 });
+    } catch (err) {
+      const detail = (err instanceof Error ? err.message : String(err ?? "")).slice(0, 300);
+      return reply
+        .code(500)
+        .send({ status: "error", message: "Database unavailable", detail });
+    }
     const keys = ["speech_ms", "language_ms", "translate_ms", "extract_ms", "priority_ms", "tts_ms", "total_ms"];
     const out: Record<string, { n: number; avg: number; p50: number; p95: number }> = {};
     for (const key of keys) {

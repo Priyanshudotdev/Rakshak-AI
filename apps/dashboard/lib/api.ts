@@ -5,6 +5,20 @@
 export const API_URL =
   (process.env.NEXT_PUBLIC_API_URL as string | undefined) ?? "http://localhost:3001";
 
+export interface ApiHttpError extends Error {
+  status?: number;
+}
+
+/** True when the API rejected the call for lack of a session (401). Callers
+ *  use this to show "sign in required" guidance instead of a raw error. */
+export function isAuthError(e: unknown): boolean {
+  if (!e) return false;
+  const status = (e as { status?: unknown }).status;
+  if (status === 401) return true;
+  const msg = e instanceof Error ? e.message : String(e ?? "");
+  return /401|sign-?in required|unauthorized|invalid credentials|admin sign-in required/i.test(msg);
+}
+
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let detail = res.statusText;
@@ -14,14 +28,25 @@ async function json<T>(res: Response): Promise<T> {
     } catch {
       /* keep status text */
     }
-    throw new Error(detail || `Request failed (${res.status})`);
+    const e = new Error(detail || `Request failed (${res.status})`) as ApiHttpError;
+    e.status = res.status;
+    throw e;
   }
   return (await res.json()) as T;
 }
 
-export async function getHealth(): Promise<{ status: string; sarvam: boolean; gemini: boolean }> {
+export interface HealthState {
+  status: string;
+  sarvam: boolean;
+  gemini: boolean;
+  store?: string;
+  count?: number;
+}
+
+/** GET /api/health — raw envelope (no {status,data} wrapper). */
+export async function getHealth(): Promise<HealthState> {
   const res = await fetch(`${API_URL}/api/health`, { cache: "no-store" });
-  return json(res);
+  return json<HealthState>(res);
 }
 
 export async function processCall(transcript: string, language?: string) {
@@ -70,11 +95,21 @@ export async function getAnalytics() {
   return json<{ status: string; data: import("./types").Analytics }>(res);
 }
 
+/** GET /api/dispatch — raw array (no {status,data} wrapper). Accepts the
+ *  {log}/{data} shapes too so POST responses stay renderable. */
 export async function getDispatchLog(): Promise<import("./types").DispatchEntry[]> {
-  const res = await fetch(`${API_URL}/api/dispatch`, { cache: "no-store" });
-  const body = await res.json();
-  if (Array.isArray(body)) return body;
-  return body?.log ?? body?.data ?? [];
+  const res = await fetch(`${API_URL}/api/dispatch`, {
+    cache: "no-store",
+    headers: { "x-operator": operatorName(), ...authHeaders() },
+  });
+  const body = await json<unknown>(res);
+  if (Array.isArray(body)) return body as import("./types").DispatchEntry[];
+  if (body && typeof body === "object") {
+    const b = body as { log?: unknown; data?: unknown };
+    if (Array.isArray(b.log)) return b.log as import("./types").DispatchEntry[];
+    if (Array.isArray(b.data)) return b.data as import("./types").DispatchEntry[];
+  }
+  return [];
 }
 
 const OPERATOR_KEY = "rakshak.operator";
@@ -189,7 +224,7 @@ export type ListenVoice = "en-IN" | "hi-IN" | "mr-IN";
 export async function translate(text: string, target: ListenVoice, source?: string) {
   const res = await fetch(`${API_URL}/api/translate`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...authHeaders() },
+    headers: { "Content-Type": "application/json", "x-operator": operatorName(), ...authHeaders() },
     body: JSON.stringify({ text, target_language_code: target, source_language_code: source }),
   });
   return json<{ status: string; data: { translated_text: string; target: string } }>(res);
@@ -198,7 +233,7 @@ export async function translate(text: string, target: ListenVoice, source?: stri
 export async function synthesize(text: string, opts?: { language_code?: string; speaker?: string; record_id?: string }) {
   const res = await fetch(`${API_URL}/api/tts`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "x-operator": operatorName(), ...authHeaders() },
     body: JSON.stringify({ text, ...opts }),
   });
   return json<{ status: string; data: { audio_base64: string; speaker: string; language_code: string } }>(res);

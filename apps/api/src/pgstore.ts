@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { selectedPool } from "./db.js";
+import { log } from "@rakshak/logger";
+import { queryWithTimeout, selectedPool } from "./db.js";
 import { computeAnalytics, verificationStatus } from "./analytics.js";
 import type { Doc } from "./store.js";
 
@@ -9,8 +10,12 @@ import type { Doc } from "./store.js";
 // — the same files applied in production — so tests and prod cannot drift.
 
 let schemaReady = false;
+// Once a migration fails we pin the process to fast-fail (no DDL replay on
+// every request): warm-start stays O(1), failures log loudly, and /api/health
+// + /api/ready report migrations:pending distinctly.
+let schemaError: string | null = null;
 
-const MIGRATIONS = [
+export const MIGRATIONS = [
   "002_records_store.sql",
   "003_verification_sources.sql",
   "004_audit_log.sql",
@@ -18,34 +23,62 @@ const MIGRATIONS = [
   "006_operator_profiles.sql",
 ];
 
+/** Readiness for /api/health + /api/ready. ok only after DDL applied once. */
+export function schemaStatus(): { ready: boolean; error: string | null } {
+  return { ready: schemaReady, error: schemaError };
+}
+
+/** Test seam: allow a fresh pg-mem DB per test. Production never calls this
+ *  — schema applies once per process boot. */
+export function resetSchemaForTests(): void {
+  schemaReady = false;
+  schemaError = null;
+}
+
 function pool() {
   const p = selectedPool();
   if (!p) throw new Error("Postgres backend selected but no pool is configured");
   return p;
 }
 
+function q(text: string, params?: unknown[]) {
+  return queryWithTimeout(pool(), text, params);
+}
+
 async function ensureSchema(): Promise<void> {
   if (schemaReady) return;
-  const sql = MIGRATIONS.map((f) =>
-    readFileSync(new URL(`../../../database/migrations/${f}`, import.meta.url), "utf-8"),
-  ).join("\n")
-    // Strip -- comments: the test double (pg-mem) cannot parse leading or
-    // trailing comment text; real Postgres is unaffected by their absence.
-    .replace(/--[^\n]*/g, "");
-  // One statement at a time: in-memory Postgres (pg-mem, tests) cannot
-  // prepare multi-statement batches, and it cannot parse IF NOT EXISTS —
-  // so the phrase is stripped and "already exists" is tolerated instead.
-  // Real Postgres accepts both forms, keeping the migration file canonical.
-  for (const stmt of sql.split(";")) {
-    const trimmed = stmt.replace(/IF NOT EXISTS/gi, " ").trim();
-    if (!trimmed) continue;
-    try {
-      await pool().query(trimmed);
-    } catch (err) {
-      if (!/already exists/i.test(String(err))) throw err;
-    }
+  if (schemaError) {
+    throw new Error(`Database schema is not ready (${schemaError})`);
   }
-  schemaReady = true;
+  try {
+    const sql = MIGRATIONS.map((f) =>
+      readFileSync(new URL(`../../../database/migrations/${f}`, import.meta.url), "utf-8"),
+    ).join("\n")
+      // Strip -- comments: the test double (pg-mem) cannot parse leading or
+      // trailing comment text; real Postgres is unaffected by their absence.
+      .replace(/--[^\n]*/g, "");
+    // One statement at a time: in-memory Postgres (pg-mem, tests) cannot
+    // prepare multi-statement batches, and it cannot parse IF NOT EXISTS —
+    // so the phrase is stripped and "already exists" is tolerated instead.
+    // Real Postgres accepts both forms, keeping the migration file canonical.
+    for (const stmt of sql.split(";")) {
+      const trimmed = stmt.replace(/IF NOT EXISTS/gi, " ").trim();
+      if (!trimmed) continue;
+      try {
+        await q(trimmed);
+      } catch (err) {
+        if (!/already exists/i.test(String(err))) throw err;
+      }
+    }
+    schemaReady = true;
+  } catch (err) {
+    schemaError = (err instanceof Error ? err.message : String(err ?? "")).slice(0, 300) || "migration failed";
+    log("error", "postgres migrations failed — schema UNREADY, failing fast until restart", {
+      err: String(err),
+      migrations: MIGRATIONS.join(","),
+    });
+    throw err;
+  }
 }
 
 function asDoc(value: unknown): Doc {
@@ -89,7 +122,7 @@ function buildEntry(input: Doc): Doc {
 }
 
 async function latest(): Promise<Doc | null> {
-  const res = await pool().query("SELECT data FROM records ORDER BY created_at DESC, id DESC LIMIT 1");
+  const res = await q("SELECT data FROM records ORDER BY created_at DESC, id DESC LIMIT 1");
   return res.rows.length ? asDoc(res.rows[0].data) : null;
 }
 
@@ -103,7 +136,7 @@ export async function saveRecord(input: Doc): Promise<Doc> {
     entry.created_at = prev.created_at;
     entry.timestamp_formatted = prev.timestamp_formatted;
   }
-  await pool().query(
+  await q(
     `INSERT INTO records (id, call_id, priority_level, original_language, created_at, data)
      VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (id) DO UPDATE SET
@@ -132,7 +165,7 @@ export async function getRecords(query?: {
   offset?: number;
 }): Promise<Doc[]> {
   await ensureSchema();
-  const res = await pool().query("SELECT data FROM records ORDER BY created_at DESC, id DESC");
+  const res = await q("SELECT data FROM records ORDER BY created_at DESC, id DESC");
   let filtered = res.rows.map((r) => asDoc(r.data));
   if (query?.q) {
     const q = query.q.toLowerCase().trim();
@@ -161,25 +194,25 @@ export async function getRecords(query?: {
 
 export async function getRecord(id: string): Promise<Doc | null> {
   await ensureSchema();
-  const res = await pool().query("SELECT data FROM records WHERE id = $1 OR call_id = $1 LIMIT 1", [id]);
+  const res = await q("SELECT data FROM records WHERE id = $1 OR call_id = $1 LIMIT 1", [id]);
   return res.rows.length ? asDoc(res.rows[0].data) : null;
 }
 
 export async function deleteRecord(id: string): Promise<boolean> {
   await ensureSchema();
-  const res = await pool().query("DELETE FROM records WHERE id = $1 OR call_id = $1 RETURNING id", [id]);
+  const res = await q("DELETE FROM records WHERE id = $1 OR call_id = $1 RETURNING id", [id]);
   return res.rows.length > 0;
 }
 
 export async function clearAll(): Promise<number> {
   await ensureSchema();
-  const res = await pool().query("DELETE FROM records RETURNING id");
+  const res = await q("DELETE FROM records RETURNING id");
   return res.rows.length;
 }
 
 export async function countRecords(): Promise<number> {
   await ensureSchema();
-  const res = await pool().query("SELECT COUNT(*) AS n FROM records");
+  const res = await q("SELECT COUNT(*) AS n FROM records");
   return Number(res.rows[0]?.n ?? 0);
 }
 
@@ -188,7 +221,7 @@ export async function updateRecordGeo(id: string, geo: Doc): Promise<boolean> {
   const current = await getRecord(id);
   if (!current) return false;
   current.extraction = { ...(current.extraction ?? {}), geo };
-  await pool().query("UPDATE records SET data = $2 WHERE id = $1 OR call_id = $1", [id, JSON.stringify(current)]);
+  await q("UPDATE records SET data = $2 WHERE id = $1 OR call_id = $1", [id, JSON.stringify(current)]);
   return true;
 }
 
@@ -198,19 +231,19 @@ export async function updateRecordDispatch(id: string, entry: Doc): Promise<bool
   if (!current) return false;
   current.dispatched = true;
   current.dispatch_info = entry;
-  await pool().query("UPDATE records SET data = $2 WHERE id = $1 OR call_id = $1", [id, JSON.stringify(current)]);
+  await q("UPDATE records SET data = $2 WHERE id = $1 OR call_id = $1", [id, JSON.stringify(current)]);
   return true;
 }
 
 export async function getAnalytics(): Promise<Doc> {
   await ensureSchema();
-  const res = await pool().query("SELECT data FROM records");
+  const res = await q("SELECT data FROM records");
   return computeAnalytics(res.rows.map((r) => asDoc(r.data)));
 }
 
 export async function getDispatchLog(): Promise<Doc[]> {
   await ensureSchema();
-  const res = await pool().query("SELECT data FROM dispatch_log ORDER BY created_at DESC, id DESC");
+  const res = await q("SELECT data FROM dispatch_log ORDER BY created_at DESC, id DESC");
   return res.rows.map((r) => asDoc(r.data));
 }
 
@@ -226,7 +259,7 @@ export interface SourceInput {
  *  from distinct-report counts + 1 for the original call. */
 export async function addIncidentSource(incidentKey: string, input: SourceInput): Promise<{ verification: string; reports: number; evidence: Doc[] }> {
   await ensureSchema();
-  await pool().query(
+  await q(
     `INSERT INTO incident_sources (id, incident_key, report_id, source, title, correlation_score, signals)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT (incident_key, report_id) DO UPDATE SET
@@ -255,7 +288,7 @@ export interface AuditInput {
 
 export async function appendAudit(input: AuditInput): Promise<Doc[]> {
   await ensureSchema();
-  await pool().query(
+  await q(
     "INSERT INTO api_audit_log (id, actor, action, entity, entity_id, detail) VALUES ($1, $2, $3, $4, $5, $6)",
     [
       `AUD-${Date.now().toString(36).toUpperCase()}-${randomBytes(2).toString("hex").toUpperCase()}`,
@@ -271,7 +304,7 @@ export async function appendAudit(input: AuditInput): Promise<Doc[]> {
 
 export async function getAuditLog(limit = 50): Promise<Doc[]> {
   await ensureSchema();
-  const res = await pool().query(
+  const res = await q(
     "SELECT id, created_at, actor, action, entity, entity_id, detail FROM api_audit_log ORDER BY created_at DESC, id DESC LIMIT $1",
     [Math.max(1, Math.min(limit, 500))],
   );
@@ -295,20 +328,20 @@ export interface OperatorInput {
 /** Operator accounts (§25). First registered operator becomes admin. */
 export async function countOperators(): Promise<number> {
   await ensureSchema();
-  const res = await pool().query("SELECT COUNT(*) AS n FROM operators");
+  const res = await q("SELECT COUNT(*) AS n FROM operators");
   return Number(res.rows[0]?.n ?? 0);
 }
 
 export async function findOperatorByName(name: string): Promise<Doc | null> {
   await ensureSchema();
-  const res = await pool().query("SELECT id, name, role, password_hash, active, created_at FROM operators WHERE lower(name) = lower($1) LIMIT 1", [name]);
+  const res = await q("SELECT id, name, role, password_hash, active, created_at FROM operators WHERE lower(name) = lower($1) LIMIT 1", [name]);
   return res.rows[0] ?? null;
 }
 
 export async function createOperator(input: OperatorInput): Promise<Doc> {
   await ensureSchema();
   const role = (await countOperators()) === 0 ? "admin" : String(input.role ?? "operator").slice(0, 20);
-  const res = await pool().query(
+  const res = await q(
     // id is app-supplied: fresh 005 tables use TEXT with no default, while
     // 001-created UUID tables accept the same uuid string. Never return hash.
     "INSERT INTO operators (id, name, role, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, name, role, active, created_at",
@@ -319,7 +352,7 @@ export async function createOperator(input: OperatorInput): Promise<Doc> {
 
 export async function createSession(operatorId: string, token: string, expiresAt: string): Promise<void> {
   await ensureSchema();
-  await pool().query("INSERT INTO operator_sessions (token, operator_id, expires_at) VALUES ($1, $2, $3)", [
+  await q("INSERT INTO operator_sessions (token, operator_id, expires_at) VALUES ($1, $2, $3)", [
     token,
     operatorId,
     expiresAt,
@@ -328,7 +361,7 @@ export async function createSession(operatorId: string, token: string, expiresAt
 
 export async function resolveSession(token: string): Promise<Doc | null> {
   await ensureSchema();
-  const res = await pool().query(
+  const res = await q(
     // o.id::text — operators.id is UUID where 001 was applied, TEXT otherwise.
     `SELECT o.id, o.name, o.role, o.active
      FROM operator_sessions s JOIN operators o ON o.id::text = s.operator_id
@@ -336,7 +369,7 @@ export async function resolveSession(token: string): Promise<Doc | null> {
     [token],
   );
   if (!res.rows.length) {
-    await pool().query("DELETE FROM operator_sessions WHERE token = $1 OR expires_at <= now()", [token]);
+    await q("DELETE FROM operator_sessions WHERE token = $1 OR expires_at <= now()", [token]);
     return null;
   }
   return res.rows[0];
@@ -344,19 +377,19 @@ export async function resolveSession(token: string): Promise<Doc | null> {
 
 export async function revokeSession(token: string): Promise<void> {
   await ensureSchema();
-  await pool().query("DELETE FROM operator_sessions WHERE token = $1", [token]);
+  await q("DELETE FROM operator_sessions WHERE token = $1", [token]);
 }
 
 export async function updatePasswordHash(operatorId: string, passwordHash: string): Promise<boolean> {
   await ensureSchema();
-  const res = await pool().query("UPDATE operators SET password_hash = $2 WHERE id = $1", [operatorId, passwordHash]);
+  const res = await q("UPDATE operators SET password_hash = $2 WHERE id = $1", [operatorId, passwordHash]);
   return (res.rowCount ?? 0) > 0;
 }
 
 export async function revokeOtherSessions(operatorId: string, keepToken: string): Promise<void> {
   await ensureSchema();
   // operator_id may be TEXT or UUID depending on which migration created it.
-  await pool().query("DELETE FROM operator_sessions WHERE operator_id::text = $1 AND token <> $2", [
+  await q("DELETE FROM operator_sessions WHERE operator_id::text = $1 AND token <> $2", [
     String(operatorId),
     keepToken,
   ]);
@@ -364,7 +397,7 @@ export async function revokeOtherSessions(operatorId: string, keepToken: string)
 
 export async function getIncidentVerification(incidentKey: string): Promise<{ verification: string; reports: number; evidence: Doc[] }> {
   await ensureSchema();
-  const res = await pool().query(
+  const res = await q(
     "SELECT report_id, source, title, correlation_score, signals FROM incident_sources WHERE incident_key = $1 ORDER BY correlation_score DESC",
     [incidentKey],
   );
@@ -394,13 +427,13 @@ export async function appendDispatchEntry(entry: Doc): Promise<Doc[]> {
   const log = await getDispatchLog();
   entry.id = nextId(log);
   const row = { ...entry };
-  await pool().query("INSERT INTO dispatch_log (id, created_at, data) VALUES ($1, now(), $2)", [
+  await q("INSERT INTO dispatch_log (id, created_at, data) VALUES ($1, now(), $2)", [
     row.id,
     JSON.stringify(row),
   ]);
   // Trim only past the cap — the NOT IN sweep is the most expensive query here.
   if (log.length + 1 > 200) {
-    await pool().query(
+    await q(
       "DELETE FROM dispatch_log WHERE id NOT IN (SELECT id FROM dispatch_log ORDER BY created_at DESC, id DESC LIMIT 200)",
     );
   }
@@ -440,7 +473,7 @@ function toPublicProfile(r: Doc): Doc {
 
 export async function getOperatorProfile(operatorId: string): Promise<Doc | null> {
   await ensureSchema();
-  const res = await pool().query(
+  const res = await q(
     "SELECT operator_id, known_languages, default_language, mobile_e164, active FROM operator_profiles WHERE operator_id = $1 LIMIT 1",
     [String(operatorId)],
   );
@@ -463,7 +496,7 @@ export async function upsertOperatorProfile(operatorId: string, patch: OperatorP
   const mobile =
     patch.mobile_e164 !== undefined ? normalizeMobileE164(patch.mobile_e164) : (existing?.mobile_e164 ?? null);
   try {
-    const res = await pool().query(
+    const res = await q(
       `INSERT INTO operator_profiles (operator_id, known_languages, default_language, mobile_e164)
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (operator_id) DO UPDATE SET
@@ -485,7 +518,7 @@ export async function findOperatorProfileByMobile(mobile: string): Promise<Doc |
   await ensureSchema();
   const norm = normalizeMobileE164(mobile);
   if (!norm) return null;
-  const res = await pool().query(
+  const res = await q(
     "SELECT operator_id, known_languages, default_language, mobile_e164, active FROM operator_profiles WHERE mobile_e164 = $1 LIMIT 1",
     [norm],
   );
@@ -494,7 +527,7 @@ export async function findOperatorProfileByMobile(mobile: string): Promise<Doc |
 
 export async function getCallTranslation(callId: string): Promise<{ call_id: string; enabled: boolean }> {
   await ensureSchema();
-  const res = await pool().query("SELECT call_id, enabled FROM call_translation WHERE call_id = $1 LIMIT 1", [
+  const res = await q("SELECT call_id, enabled FROM call_translation WHERE call_id = $1 LIMIT 1", [
     String(callId),
   ]);
   if (!res.rows.length) return { call_id: String(callId), enabled: false };
@@ -508,7 +541,7 @@ export async function setCallTranslation(
   await ensureSchema();
   const cid = String(callId);
   const flag = Boolean(enabled);
-  const res = await pool().query(
+  const res = await q(
     `INSERT INTO call_translation (call_id, enabled) VALUES ($1, $2)
      ON CONFLICT (call_id) DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now()
      RETURNING call_id, enabled`,

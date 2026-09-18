@@ -185,13 +185,104 @@ export function translationToggleHistory(
   }
   return out;
 }
+/* ---------------- Live stream helpers (gateway -> API -> dashboard) ---------------- */
+
+/** Honest socket state: first dial is "connecting", drops are "reconnecting". */
+export type LiveStatus = "connecting" | "live" | "reconnecting";
+
+/** Cap for the in-memory live feed (newest-first). */
+export const LIVE_EVENT_CAP = 30;
+
+/** Backoff for reconnect attempts: 1s, 2s, 4s … capped at 15s. */
+export function backoffDelay(attempt: number): number {
+  const n = Number.isFinite(attempt) ? Math.max(0, Math.floor(attempt)) : 0;
+  return Math.min(1000 * 2 ** n, 15_000);
+}
+
+/** Stable dedupe key: same call + same instant + same text = same utterance. */
+export function liveEventKey(e: LiveEvent): string {
+  const p = (e.payload ?? {}) as Record<string, unknown>;
+  const text =
+    (typeof p.original_text === "string" && p.original_text) ||
+    (typeof p.text === "string" && p.text) ||
+    "";
+  return `${e.name}|${e.callId}|${e.at}|${text}`;
+}
+
+/** Drop duplicates (keep first occurrence), preserving order. */
+export function dedupeLiveEvents(events: LiveEvent[]): LiveEvent[] {
+  const seen = new Set<string>();
+  const out: LiveEvent[] = [];
+  for (const e of events) {
+    if (!e || typeof e.name !== "string") continue;
+    const key = liveEventKey(e);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(e);
+  }
+  return out;
+}
+
+function byNewestFirst(a: LiveEvent, b: LiveEvent): number {
+  if (a.at === b.at) return 0;
+  return a.at < b.at ? 1 : -1;
+}
+
+/** Prepend live frame(s), dedupe, cap — newest-first. */
+export function mergeLiveEvents(
+  prev: LiveEvent[],
+  incoming: LiveEvent | LiveEvent[],
+  limit: number = LIVE_EVENT_CAP,
+): LiveEvent[] {
+  const list = Array.isArray(incoming) ? incoming : [incoming];
+  const clean = list.filter((e) => e && typeof e.name === "string");
+  if (!clean.length) return prev.slice(0, limit);
+  return dedupeLiveEvents([...clean, ...prev]).slice(0, limit);
+}
+
+/** Merge a `gateway.hello` recent[] backfill without duplicating live-appended
+ *  events. Union + dedupe + newest-first sort + cap, so missed frames slot
+ *  into place and replays never double-render. */
+export function applyHelloBackfill(
+  prev: LiveEvent[],
+  recent: LiveEvent[] | undefined,
+  limit: number = LIVE_EVENT_CAP,
+): LiveEvent[] {
+  if (!recent || !recent.length) return prev.slice(0, limit);
+  const merged = dedupeLiveEvents([...prev, ...recent]);
+  merged.sort(byNewestFirst);
+  return merged.slice(0, limit);
+}
+
+/** Latest partial text from a frame, or null when it carries none. */
+export function partialTextOf(evt: LiveEvent): string | null {
+  if (evt.name !== "transcript.partial") return null;
+  const text = (evt.payload ?? {}) as Record<string, unknown>;
+  const raw = text.original_text;
+  return typeof raw === "string" && raw ? raw : null;
+}
+
+export interface LiveFeedState {
+  connected: boolean;
+  /** Honest socket state for the LivePanel badge. */
+  status: LiveStatus;
+  events: LiveEvent[];
+  lastPartial: string | null;
+  /** Reconnect attempts since the last open (0 while live). */
+  retryCount: number;
+  /** Ms until the next dial while reconnecting (null while live). */
+  nextRetryMs: number | null;
+}
+
 /** Subscribe to GET /api/stream with backoff reconnect. Falls back silently —
  *  every panel already polls, so a dropped socket never blanks the console. */
-export function useLiveEvents(): { connected: boolean; events: LiveEvent[]; lastPartial: string | null } {
+export function useLiveEvents(): LiveFeedState {
   const qc = useQueryClient();
-  const [connected, setConnected] = useState(false);
+  const [status, setStatus] = useState<LiveStatus>("connecting");
   const [events, setEvents] = useState<LiveEvent[]>([]);
   const [lastPartial, setLastPartial] = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
+  const [nextRetryMs, setNextRetryMs] = useState<number | null>(null);
   const retry = useRef(0);
 
   useEffect(() => {
@@ -200,8 +291,12 @@ export function useLiveEvents(): { connected: boolean; events: LiveEvent[]; last
     let timer: ReturnType<typeof setTimeout> | undefined;
 
     const schedule = () => {
-      const backoff = Math.min(1000 * 2 ** retry.current, 15_000);
+      const backoff = backoffDelay(retry.current);
       retry.current += 1;
+      setRetryCount(retry.current);
+      setNextRetryMs(backoff);
+      // First dial shows "connecting"; every retry after a drop is honest.
+      setStatus("reconnecting");
       timer = setTimeout(connect, backoff);
     };
 
@@ -216,7 +311,9 @@ export function useLiveEvents(): { connected: boolean; events: LiveEvent[]; last
       }
       ws = socket;
       socket.onopen = () => {
-        setConnected(true);
+        setStatus("live");
+        setRetryCount(0);
+        setNextRetryMs(null);
         retry.current = 0;
       };
       socket.onmessage = (msg) => {
@@ -224,13 +321,14 @@ export function useLiveEvents(): { connected: boolean; events: LiveEvent[]; last
           const evt = JSON.parse(String(msg.data)) as LiveEvent;
           if (!evt?.name) return;
           if (evt.name === "gateway.hello") {
-            if (evt.recent) setEvents(evt.recent.slice(0, 30));
+            // Backfill recent history without duplicating live-appended events.
+            if (evt.recent) setEvents((prev) => applyHelloBackfill(prev, evt.recent));
             return;
           }
-          setEvents((prev) => [evt, ...prev].slice(0, 30));
+          setEvents((prev) => mergeLiveEvents(prev, evt));
           if (evt.name === "transcript.partial") {
-            const text = evt.payload?.original_text;
-            if (typeof text === "string") setLastPartial(text);
+            const text = partialTextOf(evt);
+            if (text) setLastPartial(text);
           }
           if (evt.name === "incident.created" || evt.name === "priority.updated") {
             void qc.invalidateQueries({ queryKey: ["records"] });
@@ -242,7 +340,7 @@ export function useLiveEvents(): { connected: boolean; events: LiveEvent[]; last
         }
       };
       socket.onclose = () => {
-        setConnected(false);
+        setStatus("reconnecting");
         if (!closed) schedule();
       };
       socket.onerror = () => {
@@ -266,5 +364,5 @@ export function useLiveEvents(): { connected: boolean; events: LiveEvent[]; last
     };
   }, [qc]);
 
-  return { connected, events, lastPartial };
+  return { connected: status === "live", status, events, lastPartial, retryCount, nextRetryMs };
 }
