@@ -370,6 +370,7 @@ export class AriController {
     channelId: string,
     role: LegRole,
   ): Promise<{ udp: UdpSocket; saaras: RealtimeSession; rtpPort: number; externalId: string }> {
+    let evCount = 0;
     const saaras = await this.hooks.adapter.connect(callId, {
       onPartial: (text, language) =>
         this.hooks.publish("transcript.partial", callId, { original_text: text, language: language ?? "Unknown", role }),
@@ -383,6 +384,12 @@ export class AriController {
       },
       onError: (err) => this.hooks.log("warn", "realtime error", { callId, err: String(err) }),
       onClose: () => this.hooks.log("warn", "realtime closed", { callId }),
+      onEvent: (e) => {
+        if (evCount < 40) {
+          this.hooks.log("info", "saaras event", { callId, n: evCount, event: e });
+        }
+        evCount++;
+      },
     });
     this.hooks.log("info", "realtime session open", { callId });
 
@@ -425,7 +432,11 @@ export class AriController {
           leg.nonSilent += 1;
           if (!leg.audioPresent) {
             leg.audioPresent = true;
-            this.hooks.log("info", "caller audio present", { callId: leg.callId, peak });
+            const samples: number[] = [];
+            for (let i = 0; i + 1 < pcm.length && samples.length < 12; i += 2) {
+              samples.push(pcm.readInt16LE(i));
+            }
+            this.hooks.log("info", "caller audio present", { callId: leg.callId, peak, samples: samples.join(",") });
           }
         }
         try {

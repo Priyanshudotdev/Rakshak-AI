@@ -13,6 +13,8 @@ export interface RealtimeCallbacks {
   onFinal: (text: string, language?: string) => void;
   onError: (err: Error) => void;
   onClose: () => void;
+  /** Raw server event tap (diagnostics): fired for every parsed message. */
+  onEvent?: (event: string) => void;
 }
 
 export interface RealtimeSession {
@@ -131,6 +133,11 @@ export class SaarasRealtimeAdapter implements RealtimeAdapter {
         msg = JSON.parse(String(raw)) as typeof msg;
       } catch {
         return;
+      }
+      try {
+        cb.onEvent?.(msg.event ?? "?");
+      } catch {
+        /* tap must never break the session */
       }
       switch (msg.event) {
         case "transcript.partial":
