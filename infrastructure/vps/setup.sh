@@ -149,7 +149,7 @@ grep -q "external_media_address = $PUBLIC_IP" /etc/asterisk/pjsip.conf \
 asterisk -rx "pjsip show transports" | grep -q "transport-udp" \
   && log "OK transport-udp loaded" \
   || { echo "[setup] FAIL: transport-udp not loaded" >&2; fail=1; }
-asterisk -rx "pjsip show endpoints" | grep -Eq "1001/|1002/" \
+asterisk -rx "pjsip show endpoints" | grep -Eq "Endpoint: +1001|Endpoint: +1002" \
   && log "OK endpoints 1001/1002 present" \
   || { echo "[setup] FAIL: endpoints 1001/1002 missing" >&2; fail=1; }
 asterisk -rx "dialplan show rakshak-incoming" | grep -q "Stasis" \
