@@ -142,6 +142,11 @@ interface Leg {
   rxPackets: number;
   rxBytes: number;
   rxByPt: Map<number, number>;
+  /** Peak int16 amplitude seen (0 = digital silence the whole call). */
+  peak: number;
+  /** Packets with peak above speech floor — proves real audio, not zeros. */
+  nonSilent: number;
+  audioPresent: boolean;
   txPackets: number;
   txBytes: number;
 }
@@ -347,6 +352,9 @@ export class AriController {
       rxPackets: 0,
       rxBytes: 0,
       rxByPt: new Map(),
+      peak: 0,
+      nonSilent: 0,
+      audioPresent: false,
       txPackets: 0,
       txBytes: 0,
     });
@@ -374,8 +382,9 @@ export class AriController {
         }
       },
       onError: (err) => this.hooks.log("warn", "realtime error", { callId, err: String(err) }),
-      onClose: () => undefined,
+      onClose: () => this.hooks.log("warn", "realtime closed", { callId }),
     });
+    this.hooks.log("info", "realtime session open", { callId });
 
     // One UDP port per leg: no SSRC demux needed, trivially testable.
     const rtpPort = this.nextRtpPort++;
@@ -403,6 +412,22 @@ export class AriController {
         leg.rxBytes += pcm.length;
         const pt = msg.length >= 2 ? msg[1] & 0x7f : -1;
         leg.rxByPt.set(pt, (leg.rxByPt.get(pt) ?? 0) + 1);
+        // Audio-content probe: peak amplitude distinguishes real speech from
+        // a stream of digital zeros (which counts packets but feeds STT silence).
+        let peak = 0;
+        for (let i = 0; i + 1 < pcm.length; i += 2) {
+          const s = pcm.readInt16LE(i);
+          const a = s < 0 ? -s : s;
+          if (a > peak) peak = a;
+        }
+        if (peak > leg.peak) leg.peak = peak;
+        if (peak > 500) {
+          leg.nonSilent += 1;
+          if (!leg.audioPresent) {
+            leg.audioPresent = true;
+            this.hooks.log("info", "caller audio present", { callId: leg.callId, peak });
+          }
+        }
         try {
           leg.saaras.sendAudio(pcm);
         } catch {
@@ -450,6 +475,9 @@ export class AriController {
       rxPackets: 0,
       rxBytes: 0,
       rxByPt: new Map(),
+      peak: 0,
+      nonSilent: 0,
+      audioPresent: false,
       txPackets: 0,
       txBytes: 0,
     });
@@ -639,6 +667,8 @@ export class AriController {
       rxPackets: leg.rxPackets,
       rxBytes: leg.rxBytes,
       rxByPt: [...leg.rxByPt.entries()].map(([pt, n]) => `${pt}:${n}`).join(","),
+      peak: leg.peak,
+      nonSilent: leg.nonSilent,
       txPackets: leg.txPackets,
       txBytes: leg.txBytes,
       replyPt: this.peers.get(leg.rtpPort)?.pt,
