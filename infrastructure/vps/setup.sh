@@ -60,6 +60,15 @@ grep -q '#include "pjsip.d/\*.conf"' /etc/asterisk/pjsip.conf \
   || echo '#include "pjsip.d/*.conf"' >> /etc/asterisk/pjsip.conf
 grep -q '#include "ari.d/\*.conf"' /etc/asterisk/ari.conf \
   || echo '#include "ari.d/*.conf"' >> /etc/asterisk/ari.conf
+# An #include glob matching zero files can fail the load on some builds —
+# guarantee at least one file exists in each include dir.
+if ! ls /etc/asterisk/pjsip.d/*.conf >/dev/null 2>&1; then
+  echo "; placeholder — trunk rendered here when TRUNK_* are set" > /etc/asterisk/pjsip.d/00-placeholder.conf
+fi
+if ! ls /etc/asterisk/ari.d/*.conf >/dev/null 2>&1; then
+  echo "; placeholder — secret includes land here" > /etc/asterisk/ari.d/00-placeholder.conf
+fi
+chown -R asterisk:asterisk /etc/asterisk/pjsip.d /etc/asterisk/ari.d
 
 # --- 3. VPS overrides: Elastic IP is what the world sees in SDP ---------------
 python3 - "$PUBLIC_IP" "$VPC_CIDR" <<'EOF'
@@ -115,13 +124,32 @@ fi
 # --- 5. Restart + verify -------------------------------------------------------
 log "restarting asterisk..."
 systemctl restart asterisk
-sleep 6
+sleep 8
+
+if ! systemctl is-active --quiet asterisk; then
+  echo "[setup] FAIL: asterisk service not running" >&2
+  journalctl -u asterisk --no-pager -n 30 >&2 || true
+  exit 1
+fi
+
+log "--- diagnostics (always printed) ---"
+asterisk -rx "pjsip show transports" || true
+asterisk -rx "pjsip show endpoints" || true
+asterisk -rx "dialplan show rakshak-incoming" | head -25 || true
+log "--- end diagnostics ---"
 
 fail=0
-asterisk -rx "pjsip show transports" | grep -q "$PUBLIC_IP" \
-  && log "OK transports carry $PUBLIC_IP" \
-  || { echo "[setup] FAIL: transport missing $PUBLIC_IP" >&2; fail=1; }
-asterisk -rx "pjsip show endpoints" | grep -Eq " 1001| 1002" \
+# NOTE: `pjsip show transports` prints bind addresses (0.0.0.0:5060), never the
+# external IP — so the public-IP assertion checks the deployed FILE, while the
+# CLI assertion checks the transport actually loaded.
+grep -q "external_media_address = $PUBLIC_IP" /etc/asterisk/pjsip.conf \
+  && grep -q "external_signaling_address = $PUBLIC_IP" /etc/asterisk/pjsip.conf \
+  && log "OK pjsip.conf carries external=$PUBLIC_IP" \
+  || { echo "[setup] FAIL: VPS overrides missing in pjsip.conf" >&2; fail=1; }
+asterisk -rx "pjsip show transports" | grep -q "transport-udp" \
+  && log "OK transport-udp loaded" \
+  || { echo "[setup] FAIL: transport-udp not loaded" >&2; fail=1; }
+asterisk -rx "pjsip show endpoints" | grep -Eq "1001/|1002/" \
   && log "OK endpoints 1001/1002 present" \
   || { echo "[setup] FAIL: endpoints 1001/1002 missing" >&2; fail=1; }
 asterisk -rx "dialplan show rakshak-incoming" | grep -q "Stasis" \
