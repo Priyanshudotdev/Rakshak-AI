@@ -52,6 +52,15 @@ mkdir -p /etc/asterisk/pjsip.d /etc/asterisk/ari.d
 for f in pjsip.conf extensions.conf ari.conf http.conf rtp.conf; do
   install -o asterisk -g asterisk -m 640 "$SRC_DIR/$f" "/etc/asterisk/$f"
 done
+# Tracked pjsip.d snippets (e.g. 10-provider.conf). Never touch the example
+# template or a rendered 20-trunk.conf holding live secrets.
+for f in "$SRC_DIR"/pjsip.d/*.conf; do
+  base=$(basename "$f")
+  case "$base" in
+    *.example|20-trunk.conf) continue ;;
+    *) install -o asterisk -g asterisk -m 640 "$f" "/etc/asterisk/pjsip.d/$base" ;;
+  esac
+done
 log "configs synced from $SRC_DIR"
 
 # The repo keeps the trunk in pjsip.d/ (git-ignored) but the base files have no
