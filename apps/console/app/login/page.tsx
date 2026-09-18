@@ -11,7 +11,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense } from "react";
 import { Eye, EyeSlash, ShieldCheck } from "@phosphor-icons/react";
 import { Alert, Button, Card, Field, Spinner, TextInput } from "@/components/ui";
-import { getSession, login } from "@/lib/api";
+import { getSession, login, register } from "@/lib/api";
 
 const ORG_KEY = "rakshak.console.org";
 
@@ -29,6 +29,7 @@ function LoginForm() {
   const [identifier, setIdentifier] = React.useState("");
   const [password, setPassword] = React.useState("");
   const [org, setOrg] = React.useState("");
+  const [mode, setMode] = React.useState<"signin" | "register">("signin");
   const [showPassword, setShowPassword] = React.useState(false);
   const [forgotOpen, setForgotOpen] = React.useState(false);
   const [fieldErrors, setFieldErrors] = React.useState<{ identifier?: string; password?: string }>({});
@@ -37,6 +38,8 @@ function LoginForm() {
     | { kind: "credentials" }
     | { kind: "locked" }
     | { kind: "network" }
+    | { kind: "taken" }
+    | { kind: "closed" }
     | { kind: "generic"; message: string }
   >({ kind: "none" });
   const [loading, setLoading] = React.useState(false);
@@ -57,6 +60,22 @@ function LoginForm() {
     setLoading(true);
     setFailure({ kind: "none" });
     try {
+      if (mode === "register") {
+        try {
+          await register(identifier.trim(), password);
+        } catch (err) {
+          const status = (err as { status?: number }).status;
+          if (status === 409) {
+            setFailure({ kind: "taken" });
+            return;
+          }
+          if (status === 403) {
+            setFailure({ kind: "closed" });
+            return;
+          }
+          throw err;
+        }
+      }
       await login(identifier.trim(), password);
       if (org.trim()) {
         try {
@@ -118,6 +137,17 @@ function LoginForm() {
           {failure.kind === "network" ? (
             <Alert tone="error" title="Connection problem" onRetry={() => handleSubmit()} retryLabel="Retry sign-in">
               Could not reach the server. Check your network connection and try again.
+            </Alert>
+          ) : null}
+          {failure.kind === "taken" ? (
+            <Alert tone="error" title="Name already registered">
+              This employee ID is already registered. Switch to sign-in instead.
+            </Alert>
+          ) : null}
+          {failure.kind === "closed" ? (
+            <Alert tone="error" title="Registration closed">
+              New accounts are created by an administrator. Ask your control-room admin to
+              register this employee ID.
             </Alert>
           ) : null}
           {failure.kind === "generic" ? (
@@ -201,8 +231,24 @@ function LoginForm() {
         </div>
 
         <Button type="submit" variant="primary" loading={loading} className="w-full">
-          {loading ? "Signing in…" : "Sign in"}
+          {loading ? (mode === "register" ? "Creating account…" : "Signing in…") : mode === "register" ? "Create account" : "Sign in"}
         </Button>
+        <div className="text-center">
+          <button
+            type="button"
+            onClick={() => {
+              setMode((m) => (m === "signin" ? "register" : "signin"));
+              setFailure({ kind: "none" });
+              setFieldErrors({});
+            }}
+            className="inline-flex min-h-[40px] items-center rounded text-sm font-medium text-primary-dark hover:underline"
+          >
+            {mode === "signin" ? "New operator? Create an account" : "Have an account? Sign in"}
+          </button>
+          {mode === "register" ? (
+            <p className="mt-1 text-xs text-muted">The first account becomes the administrator.</p>
+          ) : null}
+        </div>
       </form>
 
       <p className="mt-6 text-center text-xs text-muted">
