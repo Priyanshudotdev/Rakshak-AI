@@ -90,8 +90,11 @@ chown asterisk:asterisk "$TTS_DIR" "$DATA_DIR"
 install -m 644 "$DST/infrastructure/vps/rakshak-api.service" /etc/systemd/system/rakshak-api.service
 install -m 644 "$DST/infrastructure/vps/rakshak-gateway.service" /etc/systemd/system/rakshak-gateway.service
 systemctl daemon-reload
-systemctl enable --now rakshak-api >/dev/null 2>&1 || systemctl restart rakshak-api
-systemctl enable --now rakshak-gateway >/dev/null 2>&1 || systemctl restart rakshak-gateway
+systemctl enable rakshak-api rakshak-gateway >/dev/null
+# Always restart: enable --now is a no-op when already active, which would
+# leave stale builds running forever after code updates.
+systemctl restart rakshak-api
+systemctl restart rakshak-gateway
 sleep 10
 
 # --- 7. Verify --------------------------------------------------------------------
