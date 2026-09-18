@@ -21,7 +21,8 @@ const config: Config = {
         infoblue: "#2456d6",
       },
       fontFamily: {
-        sans: ['"IBM Plex Sans"', '"Segoe UI"', "system-ui", "sans-serif"],
+        sans: ["var(--font-sans)", "Inter", '"Segoe UI"', "system-ui", "sans-serif"],
+        serif: ["var(--font-season)", "Georgia", "serif"],
         mono: ['"IBM Plex Mono"', '"Cascadia Mono"', "Consolas", "monospace"],
       },
       borderRadius: { md2: "8px", lg2: "12px" },

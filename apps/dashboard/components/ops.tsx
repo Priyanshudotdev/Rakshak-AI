@@ -199,8 +199,8 @@ function Topbar({ section, count, onMenu }: { section: Section; count?: number; 
           </svg>
         </button>
         <div className="min-w-0">
-          <h1 className="truncate text-base font-semibold leading-tight text-cream">{meta.title}</h1>
-          <p className="truncate text-xs text-muted">{meta.sub}</p>
+          <h1 className="truncate font-serif text-[22px] font-medium leading-[120%] tracking-[-0.01em] text-cream">{meta.title}</h1>
+          <p className="truncate text-[13px] leading-[145%] text-muted">{meta.sub}</p>
         </div>
         <div className="ml-auto flex items-center gap-2">
           <Badge tone={health.data?.status === "ok" ? "ok" : "bad"}>
