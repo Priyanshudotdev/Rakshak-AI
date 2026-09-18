@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
+import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import websocket from "@fastify/websocket";
 import { z } from "zod";
@@ -11,6 +12,10 @@ import { auditPublishedEvent, publishEvent, registerEventRoutes } from "./events
 import { backendNameSync, stores } from "./stores.js";
 
 const app = Fastify({ logger: false, bodyLimit: 10 * 1024 * 1024 });
+// Demo-open CORS: the operator dashboard runs in browsers anywhere and talks
+// to this API directly. TODO hardening: origin: ["https://console…"],
+// credentials, plus AUTH_REQUIRED=1 with gateway-safe exemptions.
+await app.register(cors, { origin: true });
 await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024, files: 1 } });
 await app.register(websocket);
 registerEventRoutes(app);
