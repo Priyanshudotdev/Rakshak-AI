@@ -2,6 +2,8 @@
 export const RakshakEvents = [
   "call.started",
   "call.answered",
+  "operator.waiting",
+  "operator.joined",
   "speech.started",
   "transcript.partial",
   "transcript.final",

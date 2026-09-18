@@ -130,6 +130,12 @@ else
   log "no TRUNK_* set — skipping provider trunk (base loads cleanly without it)"
 fi
 
+# MixMonitor target (default packaging path, asterisk user): the dialplan records
+# to relative filenames, which land in /var/spool/asterisk/monitor. The stock
+# package already ships that dir, but guarantee it idempotently (fresh images).
+mkdir -p /var/spool/asterisk/monitor
+chown asterisk:asterisk /var/spool/asterisk/monitor
+
 # --- 5. Restart + verify -------------------------------------------------------
 log "restarting asterisk..."
 systemctl restart asterisk
@@ -183,6 +189,15 @@ d_out=$(arix "dialplan show rakshak-incoming" || true)
 printf '%s' "$d_out" | grep -q "Stasis" \
   && log "OK dialplan rakshak-incoming hands to Stasis" \
   || { echo "[setup] FAIL: dialplan broken" >&2; fail=1; }
+# Recording coverage (deployed FILE grep, deterministic — no new CLI checks):
+# both the PSTN DID path (rakshak-incoming) and the emergency test path
+# (rakshak-emergency) must MixMonitor, or calls go unrecorded.
+sed -n '/^\[rakshak-incoming\]/,/^\[/p' /etc/asterisk/extensions.conf | grep -q "MixMonitor" \
+  && log "OK rakshak-incoming records (MixMonitor)" \
+  || { echo "[setup] FAIL: rakshak-incoming missing MixMonitor" >&2; fail=1; }
+sed -n '/^\[rakshak-emergency\]/,/^\[/p' /etc/asterisk/extensions.conf | grep -q "MixMonitor" \
+  && log "OK rakshak-emergency records (MixMonitor)" \
+  || { echo "[setup] FAIL: rakshak-emergency missing MixMonitor" >&2; fail=1; }
 
 if [ "$fail" -ne 0 ]; then
   asterisk -rx "pjsip show transports" || true

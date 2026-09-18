@@ -100,6 +100,12 @@ export function signedInOperator(): { name: string; role: string } | null {
   }
 }
 
+/** Client-side role guard: delete/clear buttons are admin-only. Operators keep
+ *  dispatch-logging; anything destructive checks this first. */
+export function isSignedInAdmin(): boolean {
+  return signedInOperator()?.role === "admin";
+}
+
 export async function login(name: string, password: string) {
   const res = await fetch(`${API_URL}/api/operators/login`, {
     method: "POST",
@@ -204,6 +210,34 @@ export async function deleteRecord(id: string) {
     headers: { "x-operator": operatorName(), ...authHeaders() },
   });
   return json<{ status: string; message: string }>(res);
+}
+
+/** DELETE /api/records — clears all incident records. Admin-gated in the UI. */
+export async function clearRecords() {
+  const res = await fetch(`${API_URL}/api/records`, {
+    method: "DELETE",
+    headers: { "x-operator": operatorName(), ...authHeaders() },
+  });
+  return json<{ status: string; message: string }>(res);
+}
+
+export interface AuditEntry {
+  id?: string | number;
+  created_at?: string;
+  at?: string;
+  actor?: string;
+  action?: string;
+  entity?: string;
+  entity_id?: string;
+  detail?: unknown;
+}
+
+/** GET /api/audit?limit — newest-first audit entries ({status, data}). */
+export async function getAuditLog(limit = 50) {
+  const res = await fetch(`${API_URL}/api/audit?limit=${encodeURIComponent(String(limit))}`, {
+    cache: "no-store",
+  });
+  return json<{ status: string; data: AuditEntry[] }>(res);
 }
 
 export function audioUrl(id: string, which: "original" | "translated"): string {

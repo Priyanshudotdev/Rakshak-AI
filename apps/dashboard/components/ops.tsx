@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   audioUrl,
+  clearRecords,
   deleteRecord,
   getAnalytics,
   getDispatchLog,
@@ -28,7 +29,7 @@ import {
   type ListenVoice,
 } from "../lib/api";
 import type { LiveEvent } from "../lib/live";
-import { activeLiveCallId, translationSuggestionForCall, useLiveEvents } from "../lib/live";
+import { activeLiveCallId, translationSuggestionForCall, translationToggleHistory, useLiveEvents } from "../lib/live";
 import { summarizeVerification } from "../lib/verification";
 import type { DispatchEntry, IncidentRecord } from "../lib/types";
 import {
@@ -219,16 +220,20 @@ function AnalyticsStrip() {
 
 /* ---------------- Records ---------------- */
 
-function RecordsPanel({
+export function RecordsPanel({
   selectedId,
   onSelect,
 }: {
   selectedId: string | null;
   onSelect: (id: string) => void;
 }) {
+  const qc = useQueryClient();
   const [q, setQ] = useState("");
   const [prio, setPrio] = useState("ALL");
   const [lang, setLang] = useState("");
+  const [confirmingClear, setConfirmingClear] = useState(false);
+  const session = useSignedInOperator();
+  const isAdmin = session?.role === "admin";
   const records = useQuery({
     queryKey: ["records", q, prio, lang],
     queryFn: async () =>
@@ -241,6 +246,14 @@ function RecordsPanel({
         })
       ).data,
     refetchInterval: 4000,
+  });
+
+  const clearAll = useMutation({
+    mutationFn: () => clearRecords(),
+    onSuccess: async () => {
+      await invalidateAll(qc);
+      setConfirmingClear(false);
+    },
   });
 
   return (
@@ -298,6 +311,25 @@ function RecordsPanel({
             ))}
           </ul>
         )}
+        {isAdmin ? (
+          <div className="mt-3">
+            {!confirmingClear ? (
+              <Button variant="danger" onClick={() => setConfirmingClear(true)}>
+                Clear all records
+              </Button>
+            ) : (
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-cream">Clear all incidents?</span>
+                <Button variant="danger" disabled={clearAll.isPending} onClick={() => clearAll.mutate()}>
+                  Confirm
+                </Button>
+                <Button variant="ghost" onClick={() => setConfirmingClear(false)}>
+                  Cancel
+                </Button>
+              </div>
+            )}
+          </div>
+        ) : null}
       </CardBody>
     </Card>
   );
@@ -338,9 +370,37 @@ function TtsBox({ recordId }: { recordId: string }) {
 
 /* ---------------- Record detail ---------------- */
 
-function RecordDetail({ record, events }: { record: IncidentRecord | null; events: LiveEvent[] }) {
+export function TranslationHistory({ events, callId }: { events: LiveEvent[]; callId?: string | null }) {
+  const history = translationToggleHistory(events, callId ?? null);
+  return (
+    <div>
+      <p className="mb-2 text-xs text-muted">Live-only — no backfill; history clears on refresh.</p>
+      {!history.length ? (
+        <p className="text-sm text-muted">No translation toggles for this call yet.</p>
+      ) : (
+        <ul className="max-h-[180px] space-y-1.5 overflow-y-auto pr-1">
+          {history.map((h, i) => (
+            <li
+              key={`${h.at}-${i}`}
+              className="flex items-center gap-2 rounded-md2 border border-line/70 bg-ink px-2 py-1.5 text-xs"
+            >
+              <Badge tone={h.enabled ? "ok" : "neutral"}>{h.enabled ? "on" : "off"}</Badge>
+              <span className="truncate font-mono text-muted">{h.callId}</span>
+              {h.by ? <span className="truncate text-muted">by {h.by}</span> : null}
+              <span className="ml-auto shrink-0 font-mono text-muted">{h.at.slice(11, 19)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+export function RecordDetail({ record, events }: { record: IncidentRecord | null; events: LiveEvent[] }) {
   const qc = useQueryClient();
   const [confirming, setConfirming] = useState(false);
+  const session = useSignedInOperator();
+  const isAdmin = session?.role === "admin";
   const del = useMutation({
     mutationFn: (id: string) => deleteRecord(id),
     onSuccess: async () => {
@@ -452,6 +512,13 @@ function RecordDetail({ record, events }: { record: IncidentRecord | null; event
       </Card>
       <Card><CardHead title="Verification and corroboration" sub="Reported is not confirmed — extra sources attach here, never as new incidents" right={<Badge tone={verificationTone}>{verification.status.replace("_", " ")}</Badge>} /><CardBody>{verification.evidence.length === 0 ? (<p className="text-sm text-muted">Single source so far. Correlating reports from calls, news and official feeds will attach here with scores and signals.</p>) : (<><p className="mb-2 text-sm text-cream">{verification.reports} corroborating report{verification.reports === 1 ? "" : "s"}</p><ul className="space-y-2">{verification.evidence.map((ev, i) => (<li key={ev.report_id ?? i} className="rounded-md2 border border-line bg-ink p-2.5 text-xs"><div className="flex items-center justify-between gap-2"><span className="font-medium text-cream">{ev.report_title ?? ev.report_id ?? "Report"}</span>{ev.correlation_score != null ? (<Badge tone="info">{Math.round(ev.correlation_score * 100)}%</Badge>) : null}</div><p className="mt-0.5 text-muted">{ev.report_source ?? "unknown source"}{ev.signals?.length ? ` · ${ev.signals.join(" · ")}` : ""}</p></li>))}</ul></>)}</CardBody></Card>
 
+      <Card>
+        <CardHead title="Translation history" sub="Live-only — no backfill" />
+        <CardBody>
+          <TranslationHistory events={events} callId={record.call_id} />
+        </CardBody>
+      </Card>
+
       {(record.has_original_audio || record.has_translated_audio) && (
         <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
           {record.has_original_audio ? (
@@ -518,7 +585,7 @@ function RecordDetail({ record, events }: { record: IncidentRecord | null; event
             </p>
           ) : null}
           <div className="mt-3">
-            {!confirming ? (
+            {!isAdmin ? null : !confirming ? (
               <Button variant="danger" onClick={() => setConfirming(true)}>
                 Delete record
               </Button>

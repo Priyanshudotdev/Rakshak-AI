@@ -175,8 +175,12 @@ type LegRole = "caller" | "operator";
 interface Leg {
   callId: string;
   channelId: string;
-  /** Empty for operator legs (no media fork — they share the caller bridge). */
+  /** ExternalMedia fork for this leg's private STT tap (never in the call bridge). */
   externalId: string;
+  /** Snoop channel tapping this leg (spy=in, whisper=none). Never bridged as a caller. */
+  snoopId: string;
+  /** Private tap bridge holding [snoopId, externalId] for this leg only. */
+  tapBridgeId: string;
   bridgeId: string;
   role: LegRole;
   udp: UdpSocket | null;
@@ -433,6 +437,9 @@ export class AriController {
     // pipes, not callers. Bridging them again cascades: each fork births
     // another fork until RTP ports exhaust and Asterisk falls over.
     if (channelName.startsWith("UnicastRTP/")) return;
+    // Snoop taps enter Stasis too — they are per-leg media pipes, never
+    // callers. Forking them would cascade the same way.
+    if (channelName.startsWith("Snoop/") || channelName.toLowerCase().startsWith("snoop/")) return;
     // Duplicate StasisStart for a leg we already own: ignore, never double-fork.
     if (this.legs.has(channelId) || this.claimed.has(channelId)) return;
     this.claimed.add(channelId);
@@ -473,7 +480,11 @@ export class AriController {
 
   /** DID-routed operator flow: answer + STT fork from the start, join the
    *  newest live caller bridge, or park in the waiting room (hold message +
-   *  5s poll up to 10min) when nobody is waiting. */
+   *  5s poll up to 10min) when nobody is waiting.
+   *  Translation-only audio: the operator channel is NEVER added to the
+   *  caller mixing bridge (raw voices would stack). Operator hears
+   *  caller/AI via directed playReply into the OPERATOR channel;
+   *  caller hears operator via renditions into the CALLER channel. */
   private async setupOperatorFlow(channelId: string, caller: string, profile: OperatorProfile): Promise<void> {
     const callId = `ARI-OP-${channelId.slice(0, 8).toUpperCase()}`;
     const fork = await this.forkMedia(callId, channelId, "operator");
@@ -482,6 +493,8 @@ export class AriController {
       callId,
       channelId,
       externalId: fork.externalId,
+      snoopId: fork.snoopId,
+      tapBridgeId: fork.tapBridgeId,
       bridgeId: `waiting-${channelId}`,
       role: "operator",
       udp: fork.udp,
@@ -515,21 +528,24 @@ export class AriController {
         });
         const lang = profile.default_language || "en-IN";
         void this.playReply(channelId, OPERATOR_HOLD_MESSAGE, lang).catch(() => undefined);
+        this.hooks.publish("operator.waiting", callId, { operator_id: profile.operator_id });
         this.startWaitingPoll(channelId, profile);
       }
       return;
     }
     const lang = profile.default_language || "en-IN";
     void this.playReply(channelId, OPERATOR_HOLD_MESSAGE, lang).catch(() => undefined);
+    this.hooks.publish("operator.waiting", callId, { operator_id: profile.operator_id });
     this.startWaitingPoll(channelId, profile);
   }
 
   private async attachOperatorToCaller(operatorChannelId: string, target: Leg, profile: OperatorProfile): Promise<void> {
     const leg = this.legs.get(operatorChannelId);
     if (!leg) return;
-    await this.rest("POST", `bridges/${target.bridgeId}/addChannel`, {
-      channel: [operatorChannelId, leg.externalId],
-    });
+    // Translation-only: NEVER add the operator channel (or its STT fork) to
+    // the caller mixing bridge — raw voices would stack. Link logically so
+    // bridgePeer() still routes translations; audio flows only via directed
+    // playReply renditions into each leg's own channel.
     leg.bridgeId = target.bridgeId;
     const callerCallId = target.callId;
     const operatorCallId = leg.callId;
@@ -540,6 +556,11 @@ export class AriController {
       this.hooks.onOperatorJoin?.(callerCallId, operatorCallId, profile);
     } catch {
       /* hook must never break the join */
+    }
+    try {
+      this.hooks.publish("operator.joined", callerCallId, { call_id: callerCallId, operator_id: profile.operator_id });
+    } catch {
+      /* publish must never break the join */
     }
     this.hooks.log("info", "operator joined emergency bridge", { callId: operatorCallId, joined: callerCallId });
   }
@@ -597,9 +618,10 @@ export class AriController {
     this.waitingTimers.set(operatorChannelId, first);
   }
 
-  /** Operator join (1001 dials 9002): own STT fork like a caller, then into
-   *  the newest live emergency bridge. Operator speech is transcribed with
-   *  role=operator so it translates toward the caller — never as incidents.
+  /** Operator join (1001 dials 9002): own STT fork like a caller, then linked
+   *  to the newest live emergency bridge (translation-only, never mixed).
+   *  Operator speech is transcribed with role=operator so it translates
+   *  toward the caller — never as incidents.
    *  Nobody waiting: polite hangup, the dashboard shows nothing to join. */
   private async setupOperator(channelId: string, caller: string): Promise<void> {
     const target = [...this.legs.values()].reverse().find((l) => l.role === "caller");
@@ -612,11 +634,15 @@ export class AriController {
     const callId = `ARI-OP-${channelId.slice(0, 8).toUpperCase()}`;
     const fork = await this.forkMedia(callId, channelId, "operator");
     await this.rest("POST", `channels/${encodeURIComponent(channelId)}/answer`);
-    await this.rest("POST", `bridges/${target.bridgeId}/addChannel`, { channel: [channelId, fork.externalId] });
+    // Translation-only: operator channel + fork stay OUT of the caller bridge.
+    // Link logically so bridgePeer() routes translations; audio flows only
+    // via directed playReply renditions.
     this.legs.set(channelId, {
       callId,
       channelId,
       externalId: fork.externalId,
+      snoopId: fork.snoopId,
+      tapBridgeId: fork.tapBridgeId,
       bridgeId: target.bridgeId,
       role: "operator",
       udp: fork.udp,
@@ -632,17 +658,29 @@ export class AriController {
       txBytes: 0,
     });
     this.hooks.publish("call.answered", callId, { via: "ari", role: "operator", joined: target.callId, caller });
+    try {
+      this.hooks.publish("operator.joined", target.callId, { call_id: target.callId, operator_id: caller || callId });
+    } catch {
+      /* publish must never break the join */
+    }
     this.hooks.log("info", "operator joined emergency bridge", { callId, joined: target.callId });
   }
 
-  /** Shared media fork: Saaras session + one UDP port + External Media
-   *  channel. Role tags every final so caller speech (incidents + replies)
-   *  and operator speech (translate-only) route differently. */
+  /** Shared media fork: Saaras session + one UDP port + per-leg snoop tap.
+   *  Role tags every final so caller speech (incidents + replies)
+   *  and operator speech (translate-only) route differently.
+   *  Snoop design (translation-only, no self-transcription loop):
+   *  - spy="in" hears ONLY what this endpoint says, never the bridge mix
+   *    or our own TTS playback sent back to it. spy="both" would re-hear
+   *    TTS and loop self-transcriptions into the conversation.
+   *  - whisper="none" never injects tap audio back into the call.
+   *  - The snoop + ExternalMedia live in a private tap bridge per leg,
+   *    never in the call bridge. STT hears exactly its own leg's raw audio. */
   private async forkMedia(
     callId: string,
     channelId: string,
     role: LegRole,
-  ): Promise<{ udp: UdpSocket; saaras: RealtimeSession; rtpPort: number; externalId: string }> {
+  ): Promise<{ udp: UdpSocket; saaras: RealtimeSession; rtpPort: number; externalId: string; snoopId: string; tapBridgeId: string }> {
     let evCount = 0;
     const saaras = await this.hooks.adapter.connect(callId, {
       onPartial: (text, language) =>
@@ -665,7 +703,12 @@ export class AriController {
       },
     });
     this.hooks.log("info", "realtime session open", { callId });
-
+    // Any step below can throw (UDP bind, ARI errors). Track creations so the
+    // catch cleans up: otherwise Saaras sessions, UDP ports and tap bridges
+    // leak on every failed fork (billing + port exhaustion).
+    let externalId = "";
+    let snoopId = "";
+    let tapBridgeId = "";
     // One UDP port per leg: no SSRC demux needed, trivially testable.
     const rtpPort = this.nextRtpPort++;
     const udp = createSocket("udp4");
@@ -719,10 +762,13 @@ export class AriController {
         }
       }
     });
-    await new Promise<void>((resolve, reject) => {
-      udp.once("error", reject);
-      udp.bind(rtpPort, "0.0.0.0", () => resolve());
-    });
+    // From here on every step can throw (UDP bind, ARI errors) — the catch
+    // below cleans up creations so failed forks leak nothing.
+    try {
+      await new Promise<void>((resolve, reject) => {
+        udp.once("error", reject);
+        udp.bind(rtpPort, "0.0.0.0", () => resolve());
+      });
 
     const external = await this.rest("POST", "channels/externalMedia", {
       app: this.opts.app,
@@ -734,7 +780,45 @@ export class AriController {
       direction: "both",
       variables: { RAKSHAK_CALL_ID: callId },
     });
-    return { udp, saaras, rtpPort, externalId: String(external.id) };
+    externalId = String(external.id);
+    // Per-leg tap: snoop THIS leg channel, then bridge snoop+fork privately.
+    // The tap bridge is separate from the call bridge — the fork never hears
+    // bridge mix or TTS playback.
+    const snoop = await this.rest("POST", `channels/${encodeURIComponent(channelId)}/snoop`, {
+      app: this.opts.app,
+      spy: "in",
+      whisper: "none",
+    });
+    snoopId = String(snoop.id);
+    const tapBridge = await this.rest("POST", "bridges", { type: "mixing" });
+    tapBridgeId = String(tapBridge.id);
+    await this.rest("POST", `bridges/${tapBridgeId}/addChannel`, { channel: [snoopId, externalId] });
+    } catch (err) {
+      this.hooks.log("warn", "fork setup failed, cleaning up", { callId, err: String(err) });
+      try {
+        saaras.close();
+      } catch {
+        /* ignore */
+      }
+      try {
+        udp.close();
+      } catch {
+        /* ignore */
+      }
+      for (const [method, path] of [
+        ...(snoopId ? [["POST", `channels/${snoopId}/hangup`] as const] : []),
+        ...(externalId ? [["POST", `channels/${externalId}/hangup`] as const] : []),
+        ...(tapBridgeId ? [["DELETE", `bridges/${tapBridgeId}`] as const] : []),
+      ]) {
+        try {
+          await this.rest(method, path);
+        } catch {
+          /* best effort */
+        }
+      }
+      throw err;
+    }
+    return { udp, saaras, rtpPort, externalId, snoopId, tapBridgeId };
   }
 
   private async setupLeg(channelId: string, exten: string, caller: string): Promise<void> {
@@ -745,12 +829,17 @@ export class AriController {
 
     await this.rest("POST", `channels/${encodeURIComponent(channelId)}/answer`);
     const bridge = await this.rest("POST", "bridges", { type: "mixing" });
-    await this.rest("POST", `bridges/${bridge.id}/addChannel`, { channel: [channelId, fork.externalId] });
+    // Caller bridge holds ONLY the caller channel. The STT fork lives in its
+    // own per-leg tap bridge (snoop+ExternalMedia) so TTS playback into the
+    // caller channel never loops back into STT.
+    await this.rest("POST", `bridges/${bridge.id}/addChannel`, { channel: [channelId] });
 
     this.legs.set(channelId, {
       callId,
       channelId,
       externalId: fork.externalId,
+      snoopId: fork.snoopId,
+      tapBridgeId: fork.tapBridgeId,
       bridgeId: String(bridge.id),
       role: "caller",
       udp: fork.udp,
@@ -979,17 +1068,26 @@ export class AriController {
       /* ignore */
     }
     if (leg.role === "operator") {
-      // Operator leaves: free only their channel, the emergency leg continues.
+      // Operator leaves: free only their channel + private tap, the emergency leg continues.
       this.operatorProfiles.delete(leg.callId);
       try {
         this.hooks.onCallTeardown?.(leg.callId, leg.role, leg.bridgeId);
       } catch {
         /* hook must never break teardown */
       }
-      try {
-        await this.rest("POST", `channels/${encodeURIComponent(channelId)}/hangup`);
-      } catch (err) {
-        this.hooks.log("warn", "teardown step failed", { callId: leg.callId, err: String(err) });
+      for (const [method, path] of [
+        ["POST", `channels/${encodeURIComponent(channelId)}/hangup`],
+        // Private tap: snoop + fork + tap bridge. Without this the fork
+        // lingers in Stasis holding its RTP port (the earlier crash).
+        ...(leg.snoopId ? [["POST", `channels/${encodeURIComponent(leg.snoopId)}/hangup`] as const] : []),
+        ...(leg.externalId ? [["POST", `channels/${encodeURIComponent(leg.externalId)}/hangup`] as const] : []),
+        ...(leg.tapBridgeId ? [["DELETE", `bridges/${leg.tapBridgeId}`] as const] : []),
+      ] as const) {
+        try {
+          await this.rest(method, path);
+        } catch (err) {
+          this.hooks.log("warn", "teardown step failed", { callId: leg.callId, method, path, err: String(err) });
+        }
       }
       this.hooks.publish("call.ended", leg.callId, { reason: "operator-left" });
       return;
@@ -1011,15 +1109,33 @@ export class AriController {
         this.legs.delete(id);
         this.claimed.delete(id);
         this.operatorProfiles.delete(other.callId);
+        this.peers.delete(other.rtpPort);
+        try {
+          other.saaras?.close();
+        } catch {
+          /* ignore */
+        }
+        try {
+          other.udp?.close();
+        } catch {
+          /* ignore */
+        }
         try {
           this.hooks.onCallTeardown?.(other.callId, other.role, bridgeId);
         } catch {
           /* ignore */
         }
-        try {
-          await this.rest("POST", `channels/${encodeURIComponent(id)}/hangup`);
-        } catch {
-          /* already gone */
+        for (const [method, path] of [
+          ["POST", `channels/${encodeURIComponent(id)}/hangup`],
+          ...(other.snoopId ? [["POST", `channels/${encodeURIComponent(other.snoopId)}/hangup`] as const] : []),
+          ...(other.externalId ? [["POST", `channels/${encodeURIComponent(other.externalId)}/hangup`] as const] : []),
+          ...(other.tapBridgeId ? [["DELETE", `bridges/${other.tapBridgeId}`] as const] : []),
+        ] as const) {
+          try {
+            await this.rest(method, path);
+          } catch {
+            /* already gone */
+          }
         }
         this.hooks.publish("call.ended", other.callId, { reason: "caller-left" });
       }
@@ -1038,7 +1154,10 @@ export class AriController {
       ["POST", `channels/${leg.channelId}/hangup`],
       // The fork itself: without this it lingers in Stasis holding its RTP
       // port, and repeated calls exhaust the range (the earlier crash).
-      ["POST", `channels/${leg.externalId}/hangup`],
+      // Plus the per-leg snoop tap (snoop channel + tap bridge).
+      ...(leg.externalId ? [["POST", `channels/${leg.externalId}/hangup`] as const] : []),
+      ...(leg.snoopId ? [["POST", `channels/${leg.snoopId}/hangup`] as const] : []),
+      ...(leg.tapBridgeId ? [["DELETE", `bridges/${leg.tapBridgeId}`] as const] : []),
     ] as const) {
       try {
         await this.rest(method, path);

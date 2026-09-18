@@ -7,7 +7,7 @@ import { z } from "zod";
 import { geocodeArea, processAudio, processText, sarvam } from "@rakshak/ai-engine";
 import { config } from "@rakshak/config";
 import { log } from "@rakshak/logger";
-import { publishEvent, registerEventRoutes } from "./events.js";
+import { auditPublishedEvent, publishEvent, registerEventRoutes } from "./events.js";
 import { backendNameSync, stores } from "./stores.js";
 
 const app = Fastify({ logger: false, bodyLimit: 10 * 1024 * 1024 });
@@ -489,9 +489,13 @@ app.post("/api/operators/logout", async (req) => {
 // so unauthenticated callers always get 401 even when AUTH_REQUIRED is off.
 function normalizeMobileE164(raw: unknown): string | null {
   if (raw === null || raw === undefined) return null;
-  const s = String(raw).replace(/\s+/g, "").trim();
+  const s = String(raw).trim();
   if (!s) return null;
-  return s.startsWith("+") ? s : `+${s}`;
+  let digits = s.replace(/\D/g, "");
+  if (!digits) return null;
+  while (digits.length > 10 && digits.startsWith("0")) digits = digits.slice(1);
+  if (digits.length === 10) return `+91${digits}`;
+  return `+${digits}`;
 }
 
 const profilePutSchema = z.object({
@@ -588,13 +592,22 @@ app.post("/api/calls/:id/translation", async (req, reply) => {
   if (!parsed.success) return reply.code(400).send({ status: "error", message: "enabled is required" });
   const result = await store.setCallTranslation(id, parsed.data.enabled);
   try {
-    publishEvent("translation.toggled" as never, id, {
+    publishEvent("translation.toggled", id, {
       call_id: id,
       enabled: result.enabled,
       by: String(op.id),
     });
   } catch (err) {
     log("warn", "translation.toggled emit failed", { err: String(err) });
+  }
+  try {
+    await auditPublishedEvent("translation.toggled", id, {
+      call_id: id,
+      enabled: result.enabled,
+      by: String(op.id),
+    });
+  } catch {
+    /* audit is best-effort; never fail the toggle */
   }
   return result;
 });

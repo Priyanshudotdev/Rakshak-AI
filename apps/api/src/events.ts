@@ -41,6 +41,65 @@ export function recentEvents(limit = 20): RakshakEvent[] {
   return history.slice(0, Math.max(1, Math.min(limit, HISTORY_CAP)));
 }
 
+// Auto-audit: gateway-published live events that must also leave an
+// api_audit_log trail (actor = payload.by ?? payload.operator_id ?? "gateway",
+// action = event name, entity = "call", detail = full payload). Dual-store via
+// stores() so Postgres (004 api_audit_log) and the file mirror stay in sync.
+export function shouldAuditEvent(name: string, payload: unknown): boolean {
+  if (name === "translation.toggled" || name === "translation.suggested") return true;
+  if (name === "call.answered") {
+    if (payload && typeof payload === "object") {
+      const p = payload as Record<string, unknown>;
+      return p.role === "operator" && Boolean(p.operator_id);
+    }
+    return false;
+  }
+  return false;
+}
+
+export function buildEventAudit(
+  name: string,
+  callId: string,
+  payload: unknown,
+): { actor: string; action: string; entity: string; entity_id: string; detail: unknown } {
+  const p =
+    payload && typeof payload === "object" ? (payload as Record<string, unknown>) : ({} as Record<string, unknown>);
+  return {
+    actor: String(p.by ?? p.operator_id ?? "gateway"),
+    action: name,
+    entity: "call",
+    entity_id: callId,
+    detail: payload,
+  };
+}
+
+/** Minimal backend surface needed for the audit write (test seam). */
+export interface AuditBackend {
+  appendAudit: (input: {
+    actor: string;
+    action: string;
+    entity: string;
+    entity_id: string;
+    detail: unknown;
+  }) => Promise<unknown>;
+}
+
+/** Best-effort audit write. Never throws — audit failures must not fail publish. */
+export async function auditPublishedEvent(
+  name: string,
+  callId: string,
+  payload: unknown,
+  storeOverride?: AuditBackend,
+): Promise<void> {
+  if (!shouldAuditEvent(name, payload)) return;
+  try {
+    const backend: AuditBackend = storeOverride ?? (await stores());
+    await backend.appendAudit(buildEventAudit(name, callId, payload));
+  } catch (err) {
+    log("warn", "event audit failed", { event: name, callId, err: String(err) });
+  }
+}
+
 const publishSchema = z.object({
   name: z.string().min(1),
   callId: z.string().min(1),
@@ -82,6 +141,12 @@ export function registerEventRoutes(app: FastifyInstance): void {
     if (!parsed.success) return reply.code(400).send({ status: "error", message: "name, callId and payload are required" });
     try {
       const event = publishEvent(parsed.data.name as RakshakEventName, parsed.data.callId, parsed.data.payload);
+      try {
+        await auditPublishedEvent(parsed.data.name, parsed.data.callId, parsed.data.payload);
+      } catch {
+        // auditPublishedEvent already warns internally; a dead audit trail
+        // must never turn a good publish into a failure.
+      }
       return { status: "success", data: event };
     } catch (err) {
       return reply.code(400).send({ status: "error", message: err instanceof Error ? err.message : "Bad event" });

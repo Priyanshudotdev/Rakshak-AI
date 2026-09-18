@@ -407,12 +407,17 @@ export async function appendDispatchEntry(entry: Doc): Promise<Doc[]> {
   return getDispatchLog();
 }
 
-/** Normalize to E.164-ish form: strip all whitespace, ensure leading +. */
+/** Normalize to E.164: strip non-digits, strip trunk 0s, 10 digits -> +91.
+ *  MUST match gateway normalizeCli (ari.ts) or DID whitelist lookups miss. */
 export function normalizeMobileE164(raw: unknown): string | null {
   if (raw === null || raw === undefined) return null;
-  const s = String(raw).replace(/\s+/g, "").trim();
+  const s = String(raw).trim();
   if (!s) return null;
-  return s.startsWith("+") ? s : `+${s}`;
+  let digits = s.replace(/\D/g, "");
+  if (!digits) return null;
+  while (digits.length > 10 && digits.startsWith("0")) digits = digits.slice(1);
+  if (digits.length === 10) return `+91${digits}`;
+  return `+${digits}`;
 }
 
 function toPublicProfile(r: Doc): Doc {

@@ -62,3 +62,10 @@ SIP provider ──PJSIP──▶ Asterisk ──Stasis(rakshak)──▶ ARI �
                                                         │                              │
                                                         └──────── TTS audio ◀──────────┘ (Phase 4)
 ```
+
+Recording: both `rakshak-incoming` (PSTN DID path) and `rakshak-emergency`
+`MixMonitor(rakshak-${UNIQUEID}.wav)` before `Stasis`, landing in the default
+spool dir `/var/spool/asterisk/monitor` (setup.sh guarantees it, `asterisk` user).
+
+Operator audio separation (9002 join leg vs caller leg) is gateway-driven via
+the ARI bridge — no dialplan change needed for it.

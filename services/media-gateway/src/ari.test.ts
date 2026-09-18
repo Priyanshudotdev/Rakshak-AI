@@ -110,13 +110,24 @@ describe("tts helpers", () => {
 describe("AriController", () => {
   function setup(extraOpts: Record<string, unknown> = {}, extraHooks: Record<string, unknown> = {}) {
     const calls: Array<{ method: string; url: string; body: unknown }> = [];
+    let extCounter = 0;
+    let snoopCounter = 0;
+    let bridgeCounter = 0;
     const fetchFn = vi.fn(async (url: string, init: { method?: string; body?: string }) => {
       const body = init.body ? JSON.parse(init.body as string) : undefined;
       calls.push({ method: init.method ?? "GET", url: String(url), body });
       const path = String(url);
-      if (path.includes("/channels/externalMedia")) return { ok: true, json: async () => ({ id: "ext-1" }) };
+      if (path.includes("/channels/externalMedia")) {
+        extCounter += 1;
+        return { ok: true, json: async () => ({ id: `ext-${extCounter}` }) };
+      }
+      if (path.includes("/snoop")) {
+        snoopCounter += 1;
+        return { ok: true, json: async () => ({ id: `snoop-${snoopCounter}` }) };
+      }
       if (path.includes("/bridges") && (init.method ?? "GET") === "POST" && !path.includes("addChannel")) {
-        return { ok: true, json: async () => ({ id: "bridge-1" }) };
+        bridgeCounter += 1;
+        return { ok: true, json: async () => ({ id: `bridge-${bridgeCounter}` }) };
       }
       return { ok: true, json: async () => ({}) };
     });
@@ -125,12 +136,12 @@ describe("AriController", () => {
       kind: "test",
       connect: async () => ({ sendAudio: (c: Uint8Array) => void sentAudio.push(c), close: () => undefined }),
     };
-    const published: Array<{ name: string; callId: string }> = [];
+    const published: Array<{ name: string; callId: string; payload?: unknown }> = [];
     let socket: FakeSocket | null = null;
     const controller = new AriController(
       {
         adapter,
-        publish: (name, callId) => void published.push({ name, callId }),
+        publish: (name, callId, payload) => void published.push({ name, callId, payload }),
         log: () => undefined,
         ...extraHooks,
       },
@@ -173,8 +184,18 @@ describe("AriController", () => {
     expect(ext?.body).toMatchObject({ format: "slin16", encapsulation: "rtp" });
     expect(String((ext?.body as { external_host?: string })?.external_host)).toMatch(/^127\.0\.0\.1:\d+$/);
     expect(urls).toContain("POST bridges");
-    const add = ctx.calls.find((c) => c.url.includes("addChannel"));
-    expect(add?.body).toEqual({ channel: ["chan-abc-12345678", "ext-1"] });
+    // Per-leg snoop tap: snoop created with spy=in / whisper=none.
+    const snoop = ctx.calls.find((c) => c.url.includes("/snoop"));
+    expect(snoop).toBeTruthy();
+    expect(snoop?.body).toMatchObject({ spy: "in", whisper: "none" });
+    // Caller bridge holds ONLY the caller channel (translation-only, no fork).
+    const adds = ctx.calls.filter((c) => c.url.includes("addChannel"));
+    // One tap add (snoop+fork) + one caller add (caller only).
+    expect(adds).toHaveLength(2);
+    const callerAdd = adds.find((c) => JSON.stringify(c.body).includes("chan-abc-12345678"));
+    expect(callerAdd?.body).toEqual({ channel: ["chan-abc-12345678"] });
+    const tapAdd = adds.find((c) => JSON.stringify(c.body).includes("snoop-"));
+    expect(tapAdd?.body).toEqual({ channel: ["snoop-1", "ext-1"] });
     expect(ctx.published[0]).toMatchObject({ name: "call.answered" });
   });
 
@@ -193,10 +214,13 @@ describe("AriController", () => {
     const channelId = await startCall(ctx);
     ctx.socket().emit("message", JSON.stringify({ type: "StasisEnd", channel: { id: channelId } }));
     await new Promise((r) => setTimeout(r, 20));
-    expect(ctx.calls.some((c) => c.method === "DELETE" && c.url.includes("bridges/bridge-1"))).toBe(true);
+    expect(ctx.calls.some((c) => c.method === "DELETE" && c.url.includes("bridges/bridge-"))).toBe(true);
     const hangups = ctx.calls.filter((c) => c.method === "POST" && c.url.includes("/hangup")).map((c) => c.url);
     expect(hangups.some((u) => u.includes("chan-abc-12345678"))).toBe(true);
     expect(hangups.some((u) => u.includes("ext-1"))).toBe(true);
+    // Per-leg tap cleaned too: snoop hung up + tap bridge deleted.
+    expect(hangups.some((u) => u.includes("snoop-1"))).toBe(true);
+    expect(ctx.calls.filter((c) => c.method === "DELETE" && c.url.includes("bridges/"))).toHaveLength(2);
     expect(ctx.published.at(-1)).toMatchObject({ name: "call.ended" });
   });
 
@@ -208,12 +232,14 @@ describe("AriController", () => {
     emit("chan-dup-01", "PJSIP/1001-00000001", ["9000"]);
     emit("chan-dup-01", "PJSIP/1001-00000001", ["9000"]);
     emit("ext-1", "UnicastRTP/media-gateway-00000001", []);
+    emit("snoop-99", "Snoop/chan-dup-01-00000001", []);
     await new Promise((r) => setTimeout(r, 50));
-    // Exactly one external fork despite three StasisStart events.
+    // Exactly one external fork + one snoop despite four StasisStart events.
     expect(ctx.calls.filter((c) => c.url.includes("externalMedia"))).toHaveLength(1);
+    expect(ctx.calls.filter((c) => c.url.includes("/snoop"))).toHaveLength(1);
     expect(
       ctx.calls.filter((c) => c.method === "POST" && c.url.split("?")[0].endsWith("/bridges")),
-    ).toHaveLength(1);
+    ).toHaveLength(2);
   });
 
   it("serializes overlapping replies instead of interleaving streams", async () => {
@@ -284,7 +310,8 @@ describe("AriController", () => {
     await startOperator(ctx);
     expect(ctx.calls.filter((c) => c.url.includes("externalMedia"))).toHaveLength(0);
     expect(ctx.calls.some((c) => c.url.includes("op-chan-01/hangup"))).toBe(true);
-    expect(ctx.published).toEqual([{ name: "call.ended", callId: expect.stringContaining("ARI-OP-") }]);
+    expect(ctx.published).toHaveLength(1);
+    expect(ctx.published[0]).toMatchObject({ name: "call.ended", callId: expect.stringContaining("ARI-OP-") });
   });
 
   it("forks operator audio too and joins the same bridge", async () => {
@@ -293,27 +320,44 @@ describe("AriController", () => {
     await startOperator(ctx);
     // One fork per leg: caller STT + operator STT (role-tagged downstream).
     expect(ctx.calls.filter((c) => c.url.includes("externalMedia"))).toHaveLength(2);
-    // Operator joins the CALLER's bridge — no new bridge is created.
-    expect(ctx.calls.filter((c) => c.method === "POST" && c.url.split("?")[0].endsWith("/bridges"))).toHaveLength(1);
-    const add = ctx.calls.find((c) => c.url.includes("addChannel") && JSON.stringify(c.body).includes("op-chan-01"));
-    expect(add).toBeTruthy();
-    expect(ctx.published).toContainEqual({ name: "call.answered", callId: expect.stringContaining("ARI-OP-") });
+    // Per-leg taps: one snoop per leg, each fork in its own tap bridge.
+    expect(ctx.calls.filter((c) => c.url.includes("/snoop"))).toHaveLength(2);
+    // 1 caller bridge + 2 tap bridges (caller tap + operator tap).
+    expect(ctx.calls.filter((c) => c.method === "POST" && c.url.split("?")[0].endsWith("/bridges"))).toHaveLength(3);
+    // Translation-only: operator channel NEVER added to the caller bridge.
+    const adds = ctx.calls.filter((c) => c.url.includes("addChannel"));
+    const callerBridgeAdds = adds.filter((c) => JSON.stringify(c.body).includes("chan-abc-12345678"));
+    expect(callerBridgeAdds).toHaveLength(1);
+    expect(callerBridgeAdds[0]?.body).toEqual({ channel: ["chan-abc-12345678"] });
+    expect(adds.some((c) => {
+      const chans = (c.body as { channel?: string[] })?.channel ?? [];
+      return chans.includes("op-chan-01") && chans.includes("chan-abc-12345678");
+    })).toBe(false);
+    expect(adds.some((c) => JSON.stringify(c.body).includes("op-chan-01"))).toBe(false);
+    expect(ctx.published).toContainEqual(expect.objectContaining({ name: "call.answered", callId: expect.stringContaining("ARI-OP-") }));
+    // Logical join still routes translations + publishes the live event.
+    expect(ctx.published).toContainEqual(expect.objectContaining({ name: "operator.joined" }));
+    expect(ctx.controller.bridgePeer(ctx.published.find((p) => p.name === "call.answered" && !p.callId.includes("OP-"))!.callId)).toBeTruthy();
   });
 
   it("operator hangup leaves the emergency leg alive; caller hangup clears all", async () => {
     const ctx = setup();
     const caller = await startCall(ctx, "chan-caller-1");
     const op = await startOperator(ctx, "op-chan-1");
-    // Operator leaves: only their channel hung up, no bridge delete.
+    // Bridges: bridge-1 = caller bridge, bridge-2 = caller tap, bridge-3 = operator tap.
+    const deleteBridges = () => ctx.calls.filter((c) => c.method === "DELETE" && c.url.includes("bridges/")).map((c) => c.url);
+    // Operator leaves: only their channel + private tap cleaned, caller bridge stays.
     ctx.socket().emit("message", JSON.stringify({ type: "StasisEnd", channel: { id: op } }));
     await new Promise((r) => setTimeout(r, 20));
     expect(ctx.calls.some((c) => c.url.includes("op-chan-1/hangup"))).toBe(true);
-    expect(ctx.calls.some((c) => c.method === "DELETE" && c.url.includes("bridges"))).toBe(false);
-    expect(ctx.published.at(-1)).toEqual({ name: "call.ended", callId: expect.stringContaining("ARI-OP-") });
-    // Caller leaves: everything torn down.
+    expect(deleteBridges().some((u) => u.includes("bridge-3"))).toBe(true);
+    expect(deleteBridges().some((u) => u.includes("bridge-1"))).toBe(false);
+    expect(ctx.published.at(-1)).toMatchObject({ name: "call.ended", callId: expect.stringContaining("ARI-OP-") });
+    // Caller leaves: everything torn down (caller bridge + caller tap).
     ctx.socket().emit("message", JSON.stringify({ type: "StasisEnd", channel: { id: caller } }));
     await new Promise((r) => setTimeout(r, 20));
-    expect(ctx.calls.some((c) => c.method === "DELETE" && c.url.includes("bridges"))).toBe(true);
+    expect(deleteBridges().some((u) => u.includes("bridge-1"))).toBe(true);
+    expect(deleteBridges().some((u) => u.includes("bridge-2"))).toBe(true);
     expect(ctx.published.at(-1)).toMatchObject({ name: "call.ended" });
   });
 
@@ -365,6 +409,8 @@ describe("DID operator routing", () => {
   ) {
     const calls: Array<{ method: string; url: string; body: unknown; headers: Record<string, string> }> = [];
     let extCounter = 0;
+    let snoopCounter = 0;
+    let bridgeCounter = 0;
     const fetchFn = vi.fn(async (url: string, init: { method?: string; body?: string; headers?: Record<string, string> }) => {
       const u = String(url);
       const method = init.method ?? "GET";
@@ -388,8 +434,13 @@ describe("DID operator routing", () => {
         extCounter += 1;
         return { ok: true, json: async () => ({ id: `ext-did-${extCounter}` }) };
       }
+      if (u.includes("/snoop")) {
+        snoopCounter += 1;
+        return { ok: true, json: async () => ({ id: `snoop-did-${snoopCounter}` }) };
+      }
       if (u.includes("/bridges") && method === "POST" && !u.includes("addChannel")) {
-        return { ok: true, json: async () => ({ id: "bridge-did-1" }) };
+        bridgeCounter += 1;
+        return { ok: true, json: async () => ({ id: `bridge-did-${bridgeCounter}` }) };
       }
       return { ok: true, json: async () => ({}) };
     });
@@ -521,7 +572,15 @@ describe("DID operator routing", () => {
     ctx.socket().emit("message", stasisStart("chan-op-did-01", "9876543210", "9000"));
     await new Promise((r) => setTimeout(r, 80));
     expect(ctx.calls.filter((c) => c.url.includes("externalMedia"))).toHaveLength(2);
-    expect(ctx.calls.filter((c) => c.method === "POST" && c.url.split("?")[0].endsWith("/bridges"))).toHaveLength(1);
+    expect(ctx.calls.filter((c) => c.url.includes("/snoop"))).toHaveLength(2);
+    // 1 caller bridge + 2 per-leg tap bridges.
+    expect(ctx.calls.filter((c) => c.method === "POST" && c.url.split("?")[0].endsWith("/bridges"))).toHaveLength(3);
+    // Translation-only: operator channel never mixed into the caller bridge.
+    const adds = ctx.calls.filter((c) => c.url.includes("addChannel"));
+    expect(adds.some((c) => {
+      const chans = (c.body as { channel?: string[] })?.channel ?? [];
+      return chans.includes("chan-op-did-01");
+    })).toBe(false);
     const opAnswered = ctx.published.find((p) => p.name === "call.answered" && p.callId.includes("OP-"));
     expect(opAnswered).toBeTruthy();
     expect(opAnswered?.payload).toMatchObject({ role: "operator", operator_id: "OP-1" });
@@ -529,6 +588,10 @@ describe("DID operator routing", () => {
     const callerCallId = ctx.published.find((p) => p.name === "call.answered" && !p.callId.includes("OP-"))?.callId;
     expect(callerCallId).toBeTruthy();
     expect(ctx.controller.getOperatorProfile(callerCallId!)).toMatchObject({ operator_id: "OP-1" });
+    // Live join event for the dashboard.
+    const joined = ctx.published.find((p) => p.name === "operator.joined");
+    expect(joined).toBeTruthy();
+    expect(joined?.payload).toMatchObject({ call_id: callerCallId, operator_id: "OP-1" });
     await ctx.controller.shutdown();
   });
 
@@ -548,15 +611,22 @@ describe("DID operator routing", () => {
     expect(ctx.published).toContainEqual(
       expect.objectContaining({ name: "call.answered", callId: expect.stringContaining("ARI-OP-") }),
     );
+    expect(ctx.published).toContainEqual(
+      expect.objectContaining({ name: "operator.waiting", payload: { operator_id: "OP-1" } }),
+    );
     expect(ctx.controller.waitingCount()).toBe(1);
     expect(ctx.calls.some((c) => c.url.includes("chan-op-wait-01/hangup"))).toBe(false);
-    // A caller arrives on the same DID: the poll joins the operator.
+    // A caller arrives on the same DID: the poll joins the operator (logically, never mixed).
     ctx.socket().emit("message", stasisStart("chan-caller-late-01", "9000000002", "9000"));
     await new Promise((r) => setTimeout(r, 120));
     expect(ctx.controller.waitingCount()).toBe(0);
     expect(ctx.joins).toHaveLength(1);
-    const add = ctx.calls.find((c) => c.url.includes("addChannel") && JSON.stringify(c.body).includes("chan-op-wait-01"));
-    expect(add).toBeTruthy();
+    const adds = ctx.calls.filter((c) => c.url.includes("addChannel"));
+    expect(adds.some((c) => {
+      const chans = (c.body as { channel?: string[] })?.channel ?? [];
+      return chans.includes("chan-op-wait-01");
+    })).toBe(false);
+    expect(ctx.published).toContainEqual(expect.objectContaining({ name: "operator.joined" }));
     await ctx.controller.shutdown();
   });
 
@@ -593,6 +663,180 @@ describe("DID operator routing", () => {
     await new Promise((r) => setTimeout(r, 40));
     expect(ctx.controller.getOperatorProfile(callerCallId)).toBeNull();
     expect(ctx.teardowns.some((t) => t.callId === callerCallId)).toBe(true);
+    await ctx.controller.shutdown();
+  });
+});
+
+describe("translation-only audio + snoop taps", () => {
+  const OP_MOBILE = "+919876543210";
+  const OP_PROFILE = { operator_id: "OP-9", default_language: "en-IN", known_languages: ["en"] };
+
+  function setupTap(
+    opts: { waitRoomPollMs?: number; waitRoomTimeoutMs?: number } = {},
+  ) {
+    const calls: Array<{ method: string; url: string; body: unknown }> = [];
+    let ext = 0;
+    let snoops = 0;
+    let bridges = 0;
+    const fetchFn = vi.fn(async (url: string, init: { method?: string; body?: string }) => {
+      const body = init.body ? JSON.parse(init.body as string) : undefined;
+      calls.push({ method: init.method ?? "GET", url: String(url), body });
+      const u = String(url);
+      if (u.includes("/api/operators/lookup")) {
+        const mobile = new URL(u).searchParams.get("mobile") ?? "";
+        if (mobile === OP_MOBILE) return { ok: true, status: 200, json: async () => OP_PROFILE };
+        return { ok: false, status: 404, json: async () => ({}) };
+      }
+      if (u.includes("/channels/externalMedia")) {
+        ext += 1;
+        return { ok: true, json: async () => ({ id: `ext-tap-${ext}` }) };
+      }
+      if (u.includes("/snoop")) {
+        snoops += 1;
+        return { ok: true, json: async () => ({ id: `snoop-tap-${snoops}` }) };
+      }
+      if (u.includes("/bridges") && (init.method ?? "GET") === "POST" && !u.includes("addChannel")) {
+        bridges += 1;
+        return { ok: true, json: async () => ({ id: `bridge-tap-${bridges}` }) };
+      }
+      return { ok: true, json: async () => ({}) };
+    });
+    const adapter: RealtimeAdapter = {
+      kind: "test",
+      connect: async () => ({ sendAudio: () => undefined, close: () => undefined }),
+    };
+    const published: Array<{ name: string; callId: string; payload?: unknown }> = [];
+    let socket: FakeSocket | null = null;
+    const controller = new AriController(
+      {
+        adapter,
+        publish: (name, callId, payload) => void published.push({ name, callId, payload }),
+        log: () => undefined,
+        synthesize: async () => null,
+      },
+      {
+        baseUrl: "http://asterisk:8088",
+        apiUrl: "http://api:3001",
+        rtpHost: "127.0.0.1",
+        rtpPortBase: 37000 + Math.floor(Math.random() * 2000),
+        createSocket: () => {
+          socket = new FakeSocket();
+          setTimeout(() => socket!.emit("open"), 0);
+          return socket;
+        },
+        fetchFn: fetchFn as unknown as typeof fetch,
+        waitRoomPollMs: opts.waitRoomPollMs,
+        waitRoomTimeoutMs: opts.waitRoomTimeoutMs,
+      },
+    );
+    return { controller, calls, published, socket: () => socket as unknown as FakeSocket };
+  }
+
+  function stasis(channelId: string, name: string, caller: string, exten: string) {
+    return JSON.stringify({
+      type: "StasisStart",
+      channel: { id: channelId, name, caller: { number: caller } },
+      args: [exten],
+    });
+  }
+
+  it("operator channel NOT added to caller bridge (9002 path stays translation-only)", async () => {
+    const ctx = setupTap();
+    await ctx.controller.start();
+    ctx.socket().emit("message", stasis("chan-caller-t1", "PJSIP/9000-00000001", "9000000009", "9000"));
+    await new Promise((r) => setTimeout(r, 60));
+    ctx.socket().emit("message", stasis("chan-op-t1", "PJSIP/1001-00000002", "1001", "9002"));
+    await new Promise((r) => setTimeout(r, 60));
+    const adds = ctx.calls.filter((c) => c.url.includes("addChannel"));
+    // Caller bridge add is single-channel; tap adds are snoop+fork pairs.
+    const callerAdds = adds.filter((c) => JSON.stringify(c.body).includes("chan-caller-t1"));
+    expect(callerAdds).toHaveLength(1);
+    expect(callerAdds[0]?.body).toEqual({ channel: ["chan-caller-t1"] });
+    // Operator voice channel never appears in any bridge add.
+    expect(adds.some((c) => JSON.stringify(c.body).includes("chan-op-t1"))).toBe(false);
+    // …but the logical pairing still routes translations both ways.
+    const callerCallId = ctx.published.find((p) => p.name === "call.answered" && !p.callId.includes("OP-"))?.callId!;
+    const opCallId = ctx.published.find((p) => p.name === "call.answered" && p.callId.includes("OP-"))?.callId!;
+    expect(ctx.controller.bridgePeer(callerCallId)).toMatchObject({ callId: opCallId });
+    expect(ctx.controller.bridgePeer(opCallId)).toMatchObject({ callId: callerCallId });
+    await ctx.controller.shutdown();
+  });
+
+  it("snoop channels ignored as callers (no double fork, no cascade)", async () => {
+    const ctx = setupTap();
+    await ctx.controller.start();
+    ctx.socket().emit("message", stasis("chan-caller-t2", "PJSIP/9000-00000001", "9000000009", "9000"));
+    await new Promise((r) => setTimeout(r, 60));
+    const forksBefore = ctx.calls.filter((c) => c.url.includes("externalMedia")).length;
+    const snoopsBefore = ctx.calls.filter((c) => c.url.includes("/snoop")).length;
+    // Snoop + UnicastRTP taps enter Stasis like real channels — must be ignored.
+    ctx.socket().emit("message", stasis("snoop-tap-1", "Snoop/chan-caller-t2-00000001", "", ""));
+    ctx.socket().emit("message", stasis("snoop-lower", "snoop/chan-caller-t2-00000002", "", ""));
+    ctx.socket().emit("message", stasis("ext-tap-1", "UnicastRTP/media-gateway-00000001", "", ""));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(ctx.calls.filter((c) => c.url.includes("externalMedia"))).toHaveLength(forksBefore);
+    expect(ctx.calls.filter((c) => c.url.includes("/snoop"))).toHaveLength(snoopsBefore);
+    await ctx.controller.shutdown();
+  });
+
+  it("fork attached per-leg: snoop spy=in/whisper=none + private tap bridge", async () => {
+    const ctx = setupTap();
+    await ctx.controller.start();
+    ctx.socket().emit("message", stasis("chan-caller-t3", "PJSIP/9000-00000001", "9000000009", "9000"));
+    await new Promise((r) => setTimeout(r, 60));
+    ctx.socket().emit("message", stasis("chan-op-t3", "PJSIP/1001-00000002", "1001", "9002"));
+    await new Promise((r) => setTimeout(r, 60));
+    // One snoop per leg, each targeting its own leg channel with the safe mode.
+    const snoopCalls = ctx.calls.filter((c) => c.url.includes("/snoop"));
+    expect(snoopCalls).toHaveLength(2);
+    expect(snoopCalls[0]?.url).toContain("chan-caller-t3/snoop");
+    expect(snoopCalls[1]?.url).toContain("chan-op-t3/snoop");
+    for (const s of snoopCalls) expect(s.body).toMatchObject({ spy: "in", whisper: "none" });
+    // Each tap bridge holds exactly [snoop, fork] — never a caller channel.
+    const tapAdds = ctx.calls.filter((c) => c.url.includes("addChannel") && JSON.stringify(c.body).includes("snoop-tap-"));
+    expect(tapAdds).toHaveLength(2);
+    for (const t of tapAdds) {
+      const chans = (t.body as { channel: string[] }).channel;
+      expect(chans).toHaveLength(2);
+      expect(chans[0]).toMatch(/^snoop-tap-/);
+      expect(chans[1]).toMatch(/^ext-tap-/);
+    }
+    // No call-bridge add ever mixes a fork into caller audio.
+    const callAdds = ctx.calls.filter((c) => c.url.includes("addChannel") && !JSON.stringify(c.body).includes("snoop-tap-"));
+    expect(callAdds).toHaveLength(1);
+    expect(callAdds[0]?.body).toEqual({ channel: ["chan-caller-t3"] });
+    await ctx.controller.shutdown();
+  });
+
+  it("publishes operator.waiting on parking + operator.joined on live join", async () => {
+    const ctx = setupTap({ waitRoomPollMs: 10, waitRoomTimeoutMs: 2000 });
+    await ctx.controller.start();
+    ctx.socket().emit("message", stasis("chan-op-w1", "PJSIP/op-00000001", "9876543210", "9000"));
+    await new Promise((r) => setTimeout(r, 60));
+    const waiting = ctx.published.find((p) => p.name === "operator.waiting");
+    expect(waiting).toBeTruthy();
+    expect(waiting?.payload).toMatchObject({ operator_id: "OP-9" });
+    expect(ctx.published.some((p) => p.name === "operator.joined")).toBe(false);
+    ctx.socket().emit("message", stasis("chan-caller-w1", "PJSIP/caller-00000001", "9000000011", "9000"));
+    await new Promise((r) => setTimeout(r, 120));
+    const joined = ctx.published.find((p) => p.name === "operator.joined");
+    expect(joined).toBeTruthy();
+    expect(joined?.payload).toMatchObject({ operator_id: "OP-9" });
+    expect((joined?.payload as { call_id?: string })?.call_id).toBeTruthy();
+    await ctx.controller.shutdown();
+  });
+
+  it("publishes operator.joined immediately when a caller is already live (no waiting)", async () => {
+    const ctx = setupTap();
+    await ctx.controller.start();
+    ctx.socket().emit("message", stasis("chan-caller-w2", "PJSIP/caller-00000001", "9000000012", "9000"));
+    await new Promise((r) => setTimeout(r, 60));
+    ctx.socket().emit("message", stasis("chan-op-w2", "PJSIP/op-00000002", "9876543210", "9000"));
+    await new Promise((r) => setTimeout(r, 80));
+    expect(ctx.published.some((p) => p.name === "operator.waiting")).toBe(false);
+    const joined = ctx.published.find((p) => p.name === "operator.joined");
+    expect(joined).toBeTruthy();
+    expect(joined?.payload).toMatchObject({ operator_id: "OP-9" });
     await ctx.controller.shutdown();
   });
 });
