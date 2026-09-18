@@ -158,7 +158,20 @@ grep -q "external_media_address = $PUBLIC_IP" /etc/asterisk/pjsip.conf \
 asterisk -rx "pjsip show transports" | grep -q "transport-udp" \
   && log "OK transport-udp loaded" \
   || { echo "[setup] FAIL: transport-udp not loaded" >&2; fail=1; }
-asterisk -rx "pjsip show endpoints" | grep -Eq "Endpoint: +1001|Endpoint: +1002" \
+# Endpoint check, retried: a single `asterisk -rx` invocation can hiccup on a
+# freshly restarted box while the identical command succeeds seconds apart
+# (observed: diagnostics list the endpoints, the immediate re-check misses).
+# Match on the InAuth lines — unique, single-space, no format ambiguity.
+endpoints_ok=0
+for i in 1 2 3; do
+  eps=$(asterisk -rx "pjsip show endpoints" || true)
+  if printf '%s' "$eps" | grep -q "1001-auth" && printf '%s' "$eps" | grep -q "1002-auth"; then
+    endpoints_ok=1
+    break
+  fi
+  sleep 5
+done
+[ "$endpoints_ok" -eq 1 ] \
   && log "OK endpoints 1001/1002 present" \
   || { echo "[setup] FAIL: endpoints 1001/1002 missing" >&2; fail=1; }
 asterisk -rx "dialplan show rakshak-incoming" | grep -q "Stasis" \
