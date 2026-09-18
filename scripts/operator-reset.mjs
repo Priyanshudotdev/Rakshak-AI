@@ -10,6 +10,7 @@
 //   set -a; . /opt/rakshak/api.env; set +a
 import { createInterface } from "node:readline";
 import { readFileSync } from "node:fs";
+import { isPostgresConfigured } from "../apps/api/dist/db.js";
 import { hashPassword } from "../apps/api/dist/auth.js";
 import { createOperator, findOperatorByName, updatePasswordHash } from "../apps/api/dist/pgstore.js";
 
@@ -40,6 +41,11 @@ if (!name) {
 }
 if (!process.env.DATABASE_URL) {
   console.error("DATABASE_URL is not set (load /opt/rakshak/api.env first)");
+  process.exit(1);
+}
+// Same boot init the API performs: creates the pool pgstore draws from.
+if (!(await isPostgresConfigured())) {
+  console.error("could not reach Postgres (DATABASE_URL wrong or Neon asleep — retry)");
   process.exit(1);
 }
 
