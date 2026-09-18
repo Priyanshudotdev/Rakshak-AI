@@ -38,6 +38,7 @@ if [ ! -f "$STAGE/package.json" ]; then
   exit 1
 fi
 rm -rf "$DST"
+mkdir -p /opt/rakshak
 cp -a "$STAGE" "$DST"
 chown -R asterisk:asterisk /opt/rakshak
 
