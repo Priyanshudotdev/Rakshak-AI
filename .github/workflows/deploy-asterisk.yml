@@ -24,6 +24,12 @@ on:
       - .github/workflows/deploy-asterisk.yml
   workflow_dispatch:
 
+# One box, 1 vCPU: never run deploys concurrently (a restart racing a
+# build produces spurious check failures). Runs queue instead.
+concurrency:
+  group: vps
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
