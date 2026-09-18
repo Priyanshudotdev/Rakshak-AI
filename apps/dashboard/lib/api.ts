@@ -209,3 +209,58 @@ export async function deleteRecord(id: string) {
 export function audioUrl(id: string, which: "original" | "translated"): string {
   return `${API_URL}/api/records/${encodeURIComponent(id)}/audio?which=${which}`;
 }
+
+/* ---------------- Operator profile + per-call translation ---------------- */
+
+export interface OperatorProfile {
+  operator_id: string;
+  known_languages: string[];
+  default_language: string;
+  mobile_e164: string;
+  active: boolean;
+}
+
+export interface ProfilePatch {
+  known_languages?: string[];
+  default_language?: string;
+  mobile_e164?: string;
+}
+
+export interface TranslationState {
+  call_id: string;
+  enabled: boolean;
+}
+
+export async function getProfile(): Promise<OperatorProfile> {
+  const res = await fetch(`${API_URL}/api/operators/profile`, {
+    cache: "no-store",
+    headers: { "x-operator": operatorName(), ...authHeaders() },
+  });
+  return json<OperatorProfile>(res);
+}
+
+export async function putProfile(patch: ProfilePatch): Promise<OperatorProfile> {
+  const res = await fetch(`${API_URL}/api/operators/profile`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "x-operator": operatorName(), ...authHeaders() },
+    body: JSON.stringify(patch),
+  });
+  return json<OperatorProfile>(res);
+}
+
+export async function getTranslation(callId: string): Promise<TranslationState> {
+  const res = await fetch(`${API_URL}/api/calls/${encodeURIComponent(callId)}/translation`, {
+    cache: "no-store",
+    headers: { "x-operator": operatorName(), ...authHeaders() },
+  });
+  return json<TranslationState>(res);
+}
+
+export async function setTranslation(callId: string, enabled: boolean): Promise<TranslationState> {
+  const res = await fetch(`${API_URL}/api/calls/${encodeURIComponent(callId)}/translation`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-operator": operatorName(), ...authHeaders() },
+    body: JSON.stringify({ enabled }),
+  });
+  return json<TranslationState>(res);
+}

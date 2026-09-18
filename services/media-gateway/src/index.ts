@@ -213,6 +213,7 @@ const conversation = createConversation({
   apiUrl: API_URL,
   log,
   operatorLang: OPERATOR_LANG,
+  publish: (name, callId, payload) => void publish(name, callId, payload),
 });
 const handleFinal = conversation.handleFinal;
 
@@ -247,11 +248,28 @@ if (adapter.kind === "saaras-realtime") {
       log,
       adapter,
       synthesize: synthesizeSpeech,
-    onFinalTranscript: (callId, text, language, role, confidence) => {
-      void handleFinal(callId, text, language, role ?? "caller", confidence);
+      onFinalTranscript: (callId, text, language, role, confidence) => {
+        void handleFinal(callId, text, language, role ?? "caller", confidence);
+      },
+      onOperatorJoin: (callerCallId, _operatorCallId, profile) => {
+        try {
+          conversation.setOperatorProfile(callerCallId, profile);
+        } catch {
+          /* ignore */
+        }
+      },
+      onCallTeardown: (callId) => {
+        try {
+          conversation.clearCallState(callId);
+        } catch {
+          /* ignore */
+        }
+      },
     },
+    {
+      apiUrl: API_URL,
+      ingestKey: INGEST_KEY,
     },
-    {},
   );
   ari.start().catch((err) => log("warn", "ari controller failed", { err: String(err) }));
 }

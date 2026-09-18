@@ -7,6 +7,8 @@ export const RakshakEvents = [
   "transcript.final",
   "language.detected",
   "translation.updated",
+  "translation.toggled",
+  "translation.suggested",
   "incident.created",
   "incident.updated",
   "location.updated",

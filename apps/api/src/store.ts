@@ -399,3 +399,101 @@ export async function appendDispatchEntry(entry: Doc): Promise<Doc[]> {
   await fs.rename(tmp, DISPATCH_FILE);
   return next;
 }
+
+const OPERATOR_PROFILES_FILE = path.join(DATA_DIR, "operator_profiles.json");
+const CALL_TRANSLATION_FILE = path.join(DATA_DIR, "call_translation.json");
+
+/** Normalize to E.164-ish form: strip all whitespace, ensure leading +. */
+export function normalizeMobileE164(raw: unknown): string | null {
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).replace(/\s+/g, "").trim();
+  if (!s) return null;
+  return s.startsWith("+") ? s : `+${s}`;
+}
+
+function toPublicProfile(row: Doc): Doc {
+  return {
+    operator_id: String(row.operator_id),
+    known_languages: Array.isArray(row.known_languages) ? row.known_languages : [],
+    default_language: String(row.default_language ?? "hi-IN"),
+    mobile_e164: row.mobile_e164 ?? null,
+    active: row.active !== false,
+  };
+}
+
+export async function getOperatorProfile(operatorId: string): Promise<Doc | null> {
+  const rows = await loadJson(OPERATOR_PROFILES_FILE);
+  const hit = rows.find((r) => String(r.operator_id) === String(operatorId));
+  return hit ? toPublicProfile(hit) : null;
+}
+
+export interface OperatorProfilePatch {
+  known_languages?: string[];
+  default_language?: string;
+  mobile_e164?: string | null;
+}
+
+export async function upsertOperatorProfile(operatorId: string, patch: OperatorProfilePatch): Promise<Doc> {
+  const rows = await loadJson(OPERATOR_PROFILES_FILE);
+  const oid = String(operatorId);
+  const normalizedMobile =
+    patch.mobile_e164 === undefined ? undefined : normalizeMobileE164(patch.mobile_e164);
+  if (normalizedMobile) {
+    const clash = rows.find(
+      (r) => String(r.operator_id) !== oid && r.mobile_e164 && String(r.mobile_e164) === normalizedMobile,
+    );
+    if (clash) throw new Error("mobile_taken");
+  }
+  let existing = rows.find((r) => String(r.operator_id) === oid);
+  if (!existing) {
+    existing = {
+      operator_id: oid,
+      known_languages: [],
+      default_language: "hi-IN",
+      mobile_e164: null,
+      active: true,
+      updated_at: new Date().toISOString(),
+    };
+    rows.push(existing);
+  }
+  if (patch.known_languages !== undefined) existing.known_languages = [...patch.known_languages];
+  if (patch.default_language !== undefined) existing.default_language = patch.default_language;
+  if (patch.mobile_e164 !== undefined) existing.mobile_e164 = normalizedMobile;
+  if (existing.active === undefined) existing.active = true;
+  existing.updated_at = new Date().toISOString();
+  await saveJson(OPERATOR_PROFILES_FILE, rows);
+  return toPublicProfile(existing);
+}
+
+export async function findOperatorProfileByMobile(mobile: string): Promise<Doc | null> {
+  const norm = normalizeMobileE164(mobile);
+  if (!norm) return null;
+  const rows = await loadJson(OPERATOR_PROFILES_FILE);
+  const hit = rows.find((r) => r.mobile_e164 && String(r.mobile_e164) === norm);
+  return hit ? toPublicProfile(hit) : null;
+}
+
+export async function getCallTranslation(callId: string): Promise<{ call_id: string; enabled: boolean }> {
+  const rows = await loadJson(CALL_TRANSLATION_FILE);
+  const hit = rows.find((r) => String(r.call_id) === String(callId));
+  if (!hit) return { call_id: String(callId), enabled: false };
+  return { call_id: String(hit.call_id), enabled: Boolean(hit.enabled) };
+}
+
+export async function setCallTranslation(
+  callId: string,
+  enabled: boolean,
+): Promise<{ call_id: string; enabled: boolean }> {
+  const rows = await loadJson(CALL_TRANSLATION_FILE);
+  const cid = String(callId);
+  const flag = Boolean(enabled);
+  const hit = rows.find((r) => String(r.call_id) === cid);
+  if (hit) {
+    hit.enabled = flag;
+    hit.updated_at = new Date().toISOString();
+  } else {
+    rows.push({ call_id: cid, enabled: flag, updated_at: new Date().toISOString() });
+  }
+  await saveJson(CALL_TRANSLATION_FILE, rows);
+  return { call_id: cid, enabled: flag };
+}

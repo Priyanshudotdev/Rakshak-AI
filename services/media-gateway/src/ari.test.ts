@@ -2,7 +2,7 @@ import { mkdtemp, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { AriController, buildWav16, parseWavHeader, resampleLinear16, rtpPayload, type SocketLike } from "./ari.js";
+import { AriController, buildWav16, normalizeCli, OPERATOR_HOLD_MESSAGE, parseWavHeader, resampleLinear16, rtpPayload, type SocketLike } from "./ari.js";
 import type { RealtimeAdapter } from "./saaras.js";
 
 class FakeSocket implements SocketLike {
@@ -324,5 +324,275 @@ describe("AriController", () => {
     ctx.socket().emit("message", JSON.stringify({ type: "StasisStart", channel: {} }));
     await new Promise((r) => setTimeout(r, 20));
     expect(ctx.published).toEqual([]);
+  });
+});
+
+describe("normalizeCli", () => {
+  it("prefixes 10-digit mobiles with +91", () => {
+    expect(normalizeCli("9876543210")).toBe("+919876543210");
+    expect(normalizeCli("(98765) 43210")).toBe("+919876543210");
+    expect(normalizeCli("09876543210")).toBe("+919876543210");
+  });
+
+  it("keeps existing + prefix otherwise", () => {
+    expect(normalizeCli("+919876543210")).toBe("+919876543210");
+    expect(normalizeCli("+91 98765 43210")).toBe("+919876543210");
+    expect(normalizeCli("919876543210")).toBe("+919876543210");
+    expect(normalizeCli("+1-415-555-1234")).toBe("+14155551234");
+  });
+
+  it("handles short service numbers and empties", () => {
+    expect(normalizeCli("1001")).toBe("+1001");
+    expect(normalizeCli("")).toBe("");
+    expect(normalizeCli(null)).toBe("");
+    expect(normalizeCli(undefined)).toBe("");
+  });
+});
+
+describe("DID operator routing", () => {
+  const OP_MOBILE = "+919876543210";
+  const OP_PROFILE = { operator_id: "OP-1", default_language: "hi-IN", known_languages: ["en", "hi"] };
+
+  function setupDid(
+    opts: {
+      lookup?: (mobile: string) => { status: number; body: unknown } | { throw: Error };
+      apiUrl?: string;
+      ingestKey?: string;
+      waitRoomPollMs?: number;
+      waitRoomTimeoutMs?: number;
+      synthesizeLang?: string[];
+    } = {},
+  ) {
+    const calls: Array<{ method: string; url: string; body: unknown; headers: Record<string, string> }> = [];
+    let extCounter = 0;
+    const fetchFn = vi.fn(async (url: string, init: { method?: string; body?: string; headers?: Record<string, string> }) => {
+      const u = String(url);
+      const method = init.method ?? "GET";
+      let body: unknown;
+      try {
+        body = init.body ? JSON.parse(init.body as string) : undefined;
+      } catch {
+        body = undefined;
+      }
+      calls.push({ method, url: u, body, headers: { ...((init.headers as Record<string, string> | undefined) ?? {}) } });
+      if (u.includes("/api/operators/lookup")) {
+        const mobile = new URL(u).searchParams.get("mobile") ?? "";
+        const behavior = opts.lookup?.(mobile);
+        if (behavior && "throw" in behavior) throw (behavior as { throw: Error }).throw;
+        if (!behavior) return { ok: false, status: 404, json: async () => ({}) };
+        const b = behavior as { status: number; body: unknown };
+        if (b.status === 200) return { ok: true, status: 200, json: async () => b.body };
+        return { ok: false, status: b.status, json: async () => b.body };
+      }
+      if (u.includes("/channels/externalMedia")) {
+        extCounter += 1;
+        return { ok: true, json: async () => ({ id: `ext-did-${extCounter}` }) };
+      }
+      if (u.includes("/bridges") && method === "POST" && !u.includes("addChannel")) {
+        return { ok: true, json: async () => ({ id: "bridge-did-1" }) };
+      }
+      return { ok: true, json: async () => ({}) };
+    });
+    const sentAudio: Uint8Array[] = [];
+    const adapter: RealtimeAdapter = {
+      kind: "test",
+      connect: async () => ({ sendAudio: (c: Uint8Array) => void sentAudio.push(c), close: () => undefined }),
+    };
+    const published: Array<{ name: string; callId: string; payload?: unknown }> = [];
+    let socket: FakeSocket | null = null;
+    const joins: Array<{ caller: string; op: string }> = [];
+    const teardowns: Array<{ callId: string; role: string }> = [];
+    const synthArgs: Array<[string, string | undefined]> = [];
+    const controller = new AriController(
+      {
+        adapter,
+        publish: (name, callId, payload) => void published.push({ name, callId, payload }),
+        log: () => undefined,
+        synthesize: async (text: string, code?: string) => {
+          synthArgs.push([text, code]);
+          opts.synthesizeLang?.push(code ?? "");
+          return null;
+        },
+        onOperatorJoin: (caller, op) => void joins.push({ caller, op }),
+        onCallTeardown: (callId, role) => void teardowns.push({ callId, role }),
+      },
+      {
+        baseUrl: "http://asterisk:8088",
+        apiUrl: opts.apiUrl ?? "http://api:3001",
+        ingestKey: opts.ingestKey ?? "",
+        rtpHost: "127.0.0.1",
+        rtpPortBase: 35000 + Math.floor(Math.random() * 2000),
+        createSocket: () => {
+          socket = new FakeSocket();
+          setTimeout(() => socket!.emit("open"), 0);
+          return socket;
+        },
+        fetchFn: fetchFn as unknown as typeof fetch,
+        waitRoomPollMs: opts.waitRoomPollMs,
+        waitRoomTimeoutMs: opts.waitRoomTimeoutMs,
+      },
+    );
+    return {
+      controller,
+      calls,
+      published,
+      joins,
+      teardowns,
+      synthArgs,
+      fetchFn,
+      socket: () => socket as unknown as FakeSocket,
+    };
+  }
+
+  function stasisStart(channelId: string, caller: string, exten = "9000") {
+    return JSON.stringify({
+      type: "StasisStart",
+      channel: { id: channelId, name: `PJSIP/${caller}-00000001`, caller: { number: caller } },
+      args: [exten],
+    });
+  }
+
+  it("lookup 404 -> caller flow (same DID, unknown mobile)", async () => {
+    const ctx = setupDid({ lookup: () => ({ status: 404, body: {} }) });
+    await ctx.controller.start();
+    ctx.socket().emit("message", stasisStart("chan-caller-did-01", "9876543210", "9000"));
+    await new Promise((r) => setTimeout(r, 60));
+    const lookupCall = ctx.calls.find((c) => c.url.includes("/api/operators/lookup"));
+    expect(lookupCall?.url).toContain(encodeURIComponent("+919876543210"));
+    expect(ctx.calls.filter((c) => c.url.includes("externalMedia"))).toHaveLength(1);
+    expect(ctx.published[0]).toMatchObject({ name: "call.answered" });
+    expect(ctx.published[0]?.callId).toMatch(/^ARI-/);
+    expect(ctx.published[0]?.callId).not.toContain("OP");
+    await ctx.controller.shutdown();
+  });
+
+  it("lookup fetch failure fails closed to caller flow", async () => {
+    const ctx = setupDid({ lookup: () => ({ throw: new Error("api down") }) });
+    await ctx.controller.start();
+    ctx.socket().emit("message", stasisStart("chan-caller-fail-01", "9876543210", "9000"));
+    await new Promise((r) => setTimeout(r, 60));
+    expect(ctx.calls.filter((c) => c.url.includes("externalMedia"))).toHaveLength(1);
+    expect(ctx.published[0]).toMatchObject({ name: "call.answered" });
+    await ctx.controller.shutdown();
+  });
+
+  it("sends x-ingest-key when configured", async () => {
+    const ctx = setupDid({
+      lookup: () => ({ status: 404, body: {} }),
+      ingestKey: "secret-123",
+    });
+    await ctx.controller.start();
+    ctx.socket().emit("message", stasisStart("chan-caller-key-01", "9876543210", "9000"));
+    await new Promise((r) => setTimeout(r, 60));
+    const lookupCall = ctx.calls.find((c) => c.url.includes("/api/operators/lookup"));
+    expect(lookupCall?.headers["x-ingest-key"]).toBe("secret-123");
+    await ctx.controller.shutdown();
+  });
+
+  it("caches hits and 404s for 60s (no second fetch)", async () => {
+    const ctx = setupDid({
+      lookup: (mobile) =>
+        mobile === OP_MOBILE ? { status: 200, body: OP_PROFILE } : { status: 404, body: {} },
+    });
+    const first = await ctx.controller.lookupOperator(OP_MOBILE);
+    expect(first).toMatchObject({ operator_id: "OP-1" });
+    const fetchCountAfterFirst = ctx.fetchFn.mock.calls.length;
+    const second = await ctx.controller.lookupOperator(OP_MOBILE);
+    expect(second).toMatchObject({ operator_id: "OP-1" });
+    expect(ctx.fetchFn.mock.calls.length).toBe(fetchCountAfterFirst);
+    const miss1 = await ctx.controller.lookupOperator("+911111111111");
+    expect(miss1).toBeNull();
+    const countAfterMiss = ctx.fetchFn.mock.calls.length;
+    const miss2 = await ctx.controller.lookupOperator("+911111111111");
+    expect(miss2).toBeNull();
+    expect(ctx.fetchFn.mock.calls.length).toBe(countAfterMiss);
+    await ctx.controller.shutdown();
+  });
+
+  it("lookup hit with live caller -> operator flow joins same bridge", async () => {
+    const ctx = setupDid({
+      lookup: (mobile) => (mobile === OP_MOBILE ? { status: 200, body: OP_PROFILE } : { status: 404, body: {} }),
+    });
+    await ctx.controller.start();
+    // Caller first (unknown mobile -> caller flow).
+    ctx.socket().emit("message", stasisStart("chan-live-caller-01", "9000000001", "9000"));
+    await new Promise((r) => setTimeout(r, 60));
+    // Operator dials the SAME DID from a known mobile.
+    ctx.socket().emit("message", stasisStart("chan-op-did-01", "9876543210", "9000"));
+    await new Promise((r) => setTimeout(r, 80));
+    expect(ctx.calls.filter((c) => c.url.includes("externalMedia"))).toHaveLength(2);
+    expect(ctx.calls.filter((c) => c.method === "POST" && c.url.split("?")[0].endsWith("/bridges"))).toHaveLength(1);
+    const opAnswered = ctx.published.find((p) => p.name === "call.answered" && p.callId.includes("OP-"));
+    expect(opAnswered).toBeTruthy();
+    expect(opAnswered?.payload).toMatchObject({ role: "operator", operator_id: "OP-1" });
+    expect(ctx.joins).toHaveLength(1);
+    const callerCallId = ctx.published.find((p) => p.name === "call.answered" && !p.callId.includes("OP-"))?.callId;
+    expect(callerCallId).toBeTruthy();
+    expect(ctx.controller.getOperatorProfile(callerCallId!)).toMatchObject({ operator_id: "OP-1" });
+    await ctx.controller.shutdown();
+  });
+
+  it("no live call -> waiting room (hold message, poll, join on arrival)", async () => {
+    const ctx = setupDid({
+      lookup: (mobile) => (mobile === OP_MOBILE ? { status: 200, body: OP_PROFILE } : { status: 404, body: {} }),
+      waitRoomPollMs: 10,
+      waitRoomTimeoutMs: 2000,
+    });
+    await ctx.controller.start();
+    ctx.socket().emit("message", stasisStart("chan-op-wait-01", "+919876543210", "9000"));
+    await new Promise((r) => setTimeout(r, 60));
+    // Forked + answered from the start, hold message in operator default.
+    expect(ctx.calls.filter((c) => c.url.includes("externalMedia"))).toHaveLength(1);
+    expect(ctx.calls.some((c) => c.url.includes("chan-op-wait-01/answer"))).toBe(true);
+    expect(ctx.synthArgs).toContainEqual([OPERATOR_HOLD_MESSAGE, "hi-IN"]);
+    expect(ctx.published).toContainEqual(
+      expect.objectContaining({ name: "call.answered", callId: expect.stringContaining("ARI-OP-") }),
+    );
+    expect(ctx.controller.waitingCount()).toBe(1);
+    expect(ctx.calls.some((c) => c.url.includes("chan-op-wait-01/hangup"))).toBe(false);
+    // A caller arrives on the same DID: the poll joins the operator.
+    ctx.socket().emit("message", stasisStart("chan-caller-late-01", "9000000002", "9000"));
+    await new Promise((r) => setTimeout(r, 120));
+    expect(ctx.controller.waitingCount()).toBe(0);
+    expect(ctx.joins).toHaveLength(1);
+    const add = ctx.calls.find((c) => c.url.includes("addChannel") && JSON.stringify(c.body).includes("chan-op-wait-01"));
+    expect(add).toBeTruthy();
+    await ctx.controller.shutdown();
+  });
+
+  it("waiting-room hangup releases everything", async () => {
+    const ctx = setupDid({
+      lookup: (mobile) => (mobile === OP_MOBILE ? { status: 200, body: OP_PROFILE } : { status: 404, body: {} }),
+      waitRoomPollMs: 20,
+      waitRoomTimeoutMs: 2000,
+    });
+    await ctx.controller.start();
+    ctx.socket().emit("message", stasisStart("chan-op-wait-02", "9876543210", "9000"));
+    await new Promise((r) => setTimeout(r, 60));
+    expect(ctx.controller.waitingCount()).toBe(1);
+    ctx.socket().emit("message", JSON.stringify({ type: "StasisEnd", channel: { id: "chan-op-wait-02" } }));
+    await new Promise((r) => setTimeout(r, 40));
+    expect(ctx.controller.waitingCount()).toBe(0);
+    expect(ctx.controller.getOperatorProfile(expect.anything() as unknown as string)).toBeNull();
+    expect(ctx.teardowns.some((t) => t.role === "operator")).toBe(true);
+    await ctx.controller.shutdown();
+  });
+
+  it("caller teardown clears per-call operator profile", async () => {
+    const ctx = setupDid({
+      lookup: (mobile) => (mobile === OP_MOBILE ? { status: 200, body: OP_PROFILE } : { status: 404, body: {} }),
+    });
+    await ctx.controller.start();
+    ctx.socket().emit("message", stasisStart("chan-live-caller-02", "9000000003", "9000"));
+    await new Promise((r) => setTimeout(r, 60));
+    ctx.socket().emit("message", stasisStart("chan-op-did-02", "9876543210", "9000"));
+    await new Promise((r) => setTimeout(r, 80));
+    const callerCallId = ctx.published.find((p) => p.name === "call.answered" && !p.callId.includes("OP-"))?.callId!;
+    expect(ctx.controller.getOperatorProfile(callerCallId)).toBeTruthy();
+    ctx.socket().emit("message", JSON.stringify({ type: "StasisEnd", channel: { id: "chan-live-caller-02" } }));
+    await new Promise((r) => setTimeout(r, 40));
+    expect(ctx.controller.getOperatorProfile(callerCallId)).toBeNull();
+    expect(ctx.teardowns.some((t) => t.callId === callerCallId)).toBe(true);
+    await ctx.controller.shutdown();
   });
 });

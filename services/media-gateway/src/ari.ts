@@ -20,8 +20,46 @@ export interface AriOptions {
   rtpPortBase?: number;
   /** Shared sounds dir (same volume as Asterisk's sounds/tts). */
   ttsDir?: string;
+  /** Base URL of the Rakshak API (operator lookup). Defaults to process.env.API_URL. */
+  apiUrl?: string;
+  /** Ingest key for API calls. Defaults to process.env.EVENT_INGEST_KEY. */
+  ingestKey?: string;
+  /** TTL for the operator lookup cache (default 60s). */
+  lookupTtlMs?: number;
+  /** Waiting-room poll interval (default 5000ms). Inject small values in tests. */
+  waitRoomPollMs?: number;
+  /** Waiting-room max wait (default 10min). Inject small values in tests. */
+  waitRoomTimeoutMs?: number;
   createSocket?: (url: string) => SocketLike;
   fetchFn?: typeof fetch;
+}
+
+/** Operator directory profile (mirrors GET /api/operators/lookup). */
+export interface OperatorProfile {
+  operator_id: string;
+  default_language: string;
+  known_languages: string[];
+}
+
+/** Hold message played to operators waiting for a live emergency call. */
+export const OPERATOR_HOLD_MESSAGE = "You are connected. Waiting for a live emergency call.";
+
+/** Normalize a raw CLI/caller number to E.164.
+ *  Strips non-digits; 10 digits -> prefix +91; otherwise keeps the existing
+ *  + prefix (assumes the digits already include a country code). Short
+ *  service numbers (e.g. "1001") become "+1001" so lookups stay consistent. */
+export function normalizeCli(raw: string | null | undefined): string {
+  const s = String(raw ?? "").trim();
+  if (!s) return "";
+  const hadPlus = s.startsWith("+");
+  let digits = s.replace(/\D/g, "");
+  if (!digits) return "";
+  while (digits.length > 10 && digits.startsWith("0")) digits = digits.slice(1);
+  if (digits.length === 10) return `+91${digits}`;
+  if (digits.length === 12 && digits.startsWith("91")) return `+${digits}`;
+  if (hadPlus) return `+${digits}`;
+  if (digits.length > 10) return `+${digits}`;
+  return `+${digits}`;
 }
 
 export interface SocketLike {
@@ -38,6 +76,11 @@ export interface AriHooks {
   onFinalTranscript?: (callId: string, text: string, language: string | undefined, role: LegRole, confidence?: number) => void;
   /** Synthesize speech in the given language code. Returns wav bytes (or null). */
   synthesize?: (text: string, languageCode?: string) => Promise<Buffer | null>;
+  /** Fired when a DID-routed operator joins a caller bridge (so the
+   *  conversation layer can cache the profile per call at join). */
+  onOperatorJoin?: (callerCallId: string, operatorCallId: string, profile: OperatorProfile) => void;
+  /** Fired when a leg tears down (so per-call caches can be cleared). */
+  onCallTeardown?: (callId: string, role: LegRole, bridgeId: string) => void;
 }
 
 interface RtpPeer {
@@ -174,6 +217,12 @@ export class AriController {
   // StasisStart events for one channel would double-fork without this.
   private readonly claimed = new Set<string>();
   private stopped = false;
+  /** Operator lookup cache: E164 -> profile (hit) or null (404). 60s TTL. */
+  private readonly lookupCache = new Map<string, { value: OperatorProfile | null; expiresAt: number }>();
+  /** Operator profiles cached per call at join: callId or bridgeId -> profile. */
+  private readonly operatorProfiles = new Map<string, OperatorProfile>();
+  /** Waiting-room poll timers: operator channelId -> timeout. */
+  private readonly waitingTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(hooks: AriHooks, opts: AriOptions = {}) {
     this.hooks = hooks;
@@ -185,10 +234,82 @@ export class AriController {
       rtpHost: opts.rtpHost ?? process.env.GATEWAY_RTP_HOST ?? "media-gateway",
       rtpPortBase: opts.rtpPortBase ?? Number(process.env.GATEWAY_RTP_BASE ?? 17777),
       ttsDir: opts.ttsDir ?? process.env.TTS_FILE_DIR ?? "/tts-out",
+      apiUrl: (opts.apiUrl ?? process.env.API_URL ?? "http://localhost:3001").replace(/\/$/, ""),
+      ingestKey: opts.ingestKey ?? process.env.EVENT_INGEST_KEY ?? "",
+      lookupTtlMs: opts.lookupTtlMs ?? 60_000,
+      waitRoomPollMs: opts.waitRoomPollMs ?? 5000,
+      waitRoomTimeoutMs: opts.waitRoomTimeoutMs ?? 10 * 60 * 1000,
       createSocket: opts.createSocket,
       fetchFn: opts.fetchFn,
     };
     this.nextRtpPort = this.opts.rtpPortBase;
+  }
+
+  /** Operator directory lookup with a 60s TTL cache (hits + 404s).
+   *  Never throws: API down / unexpected shape fails CLOSED to null
+   *  (caller flow) so emergency calls are never blocked on this. */
+  async lookupOperator(mobileE164: string): Promise<OperatorProfile | null> {
+    if (!mobileE164) return null;
+    const now = Date.now();
+    const cached = this.lookupCache.get(mobileE164);
+    if (cached && cached.expiresAt > now) return cached.value;
+    // Drop expired entries lazily.
+    if (cached) this.lookupCache.delete(mobileE164);
+    const ttl = this.opts.lookupTtlMs ?? 60_000;
+    const apiUrl = (this.opts.apiUrl ?? "").replace(/\/$/, "");
+    if (!apiUrl) return null;
+    const url = `${apiUrl}/api/operators/lookup?mobile=${encodeURIComponent(mobileE164)}`;
+    try {
+      const fetchFn = this.opts.fetchFn ?? fetch;
+      const headers: Record<string, string> = {};
+      const key = this.opts.ingestKey ?? "";
+      if (key) headers["x-ingest-key"] = key;
+      const res = (await fetchFn(url, { method: "GET", headers } as never)) as unknown as {
+        ok: boolean;
+        status?: number;
+        json: () => Promise<unknown>;
+      };
+      if (!res.ok) {
+        if (res.status === 404) {
+          this.lookupCache.set(mobileE164, { value: null, expiresAt: Date.now() + ttl });
+        }
+        return null;
+      }
+      let body: unknown = null;
+      try {
+        body = await res.json();
+      } catch {
+        return null;
+      }
+      const data = (body as { data?: unknown } | null)?.data ?? body;
+      const rec = data as { operator_id?: unknown; default_language?: unknown; known_languages?: unknown };
+      if (rec && typeof rec.operator_id === "string" && rec.operator_id) {
+        const profile: OperatorProfile = {
+          operator_id: rec.operator_id,
+          default_language: typeof rec.default_language === "string" && rec.default_language ? rec.default_language : "en-IN",
+          known_languages: Array.isArray(rec.known_languages) ? rec.known_languages.map((x) => String(x)) : [],
+        };
+        this.lookupCache.set(mobileE164, { value: profile, expiresAt: Date.now() + ttl });
+        return profile;
+      }
+      return null;
+    } catch (err) {
+      this.hooks.log("warn", "operator lookup failed, failing closed to caller", {
+        mobile: mobileE164,
+        err: String(err),
+      });
+      return null;
+    }
+  }
+
+  /** Profile cached per call at join (operator callId, caller callId or bridgeId). */
+  getOperatorProfile(callIdOrBridge: string): OperatorProfile | null {
+    return this.operatorProfiles.get(callIdOrBridge) ?? null;
+  }
+
+  /** Number of operators currently parked in the waiting room (test seam). */
+  waitingCount(): number {
+    return this.waitingTimers.size;
   }
 
   private api(path: string): string {
@@ -316,12 +437,164 @@ export class AriController {
     if (this.legs.has(channelId) || this.claimed.has(channelId)) return;
     this.claimed.add(channelId);
     try {
-      if (exten === "9002") await this.setupOperator(channelId, caller);
-      else await this.setupLeg(channelId, exten, caller);
+      // DID routing: callers and operators dial the SAME public DID. The only
+      // discriminator is the CLI — operators are known mobiles in the directory.
+      // Lookup failures fail CLOSED to caller flow (never block emergencies).
+      const cli = normalizeCli(caller);
+      let profile: OperatorProfile | null = null;
+      if (cli) {
+        try {
+          profile = await this.lookupOperator(cli);
+        } catch {
+          profile = null;
+        }
+      }
+      if (profile) {
+        await this.setupOperatorFlow(channelId, caller, profile);
+      } else if (exten === "9002") {
+        await this.setupOperator(channelId, caller);
+      } else {
+        await this.setupLeg(channelId, exten, caller);
+      }
     } catch (err) {
       this.claimed.delete(channelId);
       throw err;
     }
+  }
+
+  private findNewestCaller(): Leg | null {
+    const all = [...this.legs.values()];
+    for (let i = all.length - 1; i >= 0; i--) {
+      const leg = all[i];
+      if (leg?.role === "caller") return leg;
+    }
+    return null;
+  }
+
+  /** DID-routed operator flow: answer + STT fork from the start, join the
+   *  newest live caller bridge, or park in the waiting room (hold message +
+   *  5s poll up to 10min) when nobody is waiting. */
+  private async setupOperatorFlow(channelId: string, caller: string, profile: OperatorProfile): Promise<void> {
+    const callId = `ARI-OP-${channelId.slice(0, 8).toUpperCase()}`;
+    const fork = await this.forkMedia(callId, channelId, "operator");
+    await this.rest("POST", `channels/${encodeURIComponent(channelId)}/answer`);
+    this.legs.set(channelId, {
+      callId,
+      channelId,
+      externalId: fork.externalId,
+      bridgeId: `waiting-${channelId}`,
+      role: "operator",
+      udp: fork.udp,
+      saaras: fork.saaras,
+      rtpPort: fork.rtpPort,
+      rxPackets: 0,
+      rxBytes: 0,
+      rxByPt: new Map(),
+      peak: 0,
+      nonSilent: 0,
+      audioPresent: false,
+      txPackets: 0,
+      txBytes: 0,
+    });
+    this.operatorProfiles.set(callId, profile);
+    this.hooks.publish("call.answered", callId, {
+      via: "ari",
+      role: "operator",
+      caller,
+      operator_id: profile.operator_id,
+    });
+    this.hooks.log("info", "operator answered (DID routing)", { callId, operator: profile.operator_id, caller });
+    const target = this.findNewestCaller();
+    if (target) {
+      try {
+        await this.attachOperatorToCaller(channelId, target, profile);
+      } catch (err) {
+        this.hooks.log("warn", "operator immediate join failed, entering waiting room", {
+          callId,
+          err: String(err),
+        });
+        const lang = profile.default_language || "en-IN";
+        void this.playReply(channelId, OPERATOR_HOLD_MESSAGE, lang).catch(() => undefined);
+        this.startWaitingPoll(channelId, profile);
+      }
+      return;
+    }
+    const lang = profile.default_language || "en-IN";
+    void this.playReply(channelId, OPERATOR_HOLD_MESSAGE, lang).catch(() => undefined);
+    this.startWaitingPoll(channelId, profile);
+  }
+
+  private async attachOperatorToCaller(operatorChannelId: string, target: Leg, profile: OperatorProfile): Promise<void> {
+    const leg = this.legs.get(operatorChannelId);
+    if (!leg) return;
+    await this.rest("POST", `bridges/${target.bridgeId}/addChannel`, {
+      channel: [operatorChannelId, leg.externalId],
+    });
+    leg.bridgeId = target.bridgeId;
+    const callerCallId = target.callId;
+    const operatorCallId = leg.callId;
+    this.operatorProfiles.set(operatorCallId, profile);
+    this.operatorProfiles.set(callerCallId, profile);
+    this.operatorProfiles.set(target.bridgeId, profile);
+    try {
+      this.hooks.onOperatorJoin?.(callerCallId, operatorCallId, profile);
+    } catch {
+      /* hook must never break the join */
+    }
+    this.hooks.log("info", "operator joined emergency bridge", { callId: operatorCallId, joined: callerCallId });
+  }
+
+  private startWaitingPoll(operatorChannelId: string, profile: OperatorProfile): void {
+    const pollMs = this.opts.waitRoomPollMs ?? 5000;
+    const timeoutMs = this.opts.waitRoomTimeoutMs ?? 10 * 60 * 1000;
+    const deadline = Date.now() + timeoutMs;
+    const existing = this.waitingTimers.get(operatorChannelId);
+    if (existing) {
+      try {
+        clearTimeout(existing);
+      } catch {
+        /* ignore */
+      }
+      this.waitingTimers.delete(operatorChannelId);
+    }
+    const tick = async (): Promise<void> => {
+      this.waitingTimers.delete(operatorChannelId);
+      const leg = this.legs.get(operatorChannelId);
+      if (!leg) return;
+      const target = this.findNewestCaller();
+      if (target) {
+        try {
+          await this.attachOperatorToCaller(operatorChannelId, target, profile);
+        } catch (err) {
+          this.hooks.log("warn", "operator poll join failed", { err: String(err) });
+          if (Date.now() < deadline && this.legs.has(operatorChannelId)) {
+            const t = setTimeout(() => void tick(), pollMs);
+            (t as unknown as { unref?: () => void }).unref?.();
+            this.waitingTimers.set(operatorChannelId, t);
+          }
+        }
+        return;
+      }
+      if (Date.now() >= deadline) {
+        try {
+          await this.rest("POST", `channels/${encodeURIComponent(operatorChannelId)}/hangup`);
+        } catch {
+          /* already gone */
+        }
+        try {
+          await this.teardown(operatorChannelId);
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      const t = setTimeout(() => void tick(), pollMs);
+      (t as unknown as { unref?: () => void }).unref?.();
+      this.waitingTimers.set(operatorChannelId, t);
+    };
+    const first = setTimeout(() => void tick(), pollMs);
+    (first as unknown as { unref?: () => void }).unref?.();
+    this.waitingTimers.set(operatorChannelId, first);
   }
 
   /** Operator join (1001 dials 9002): own STT fork like a caller, then into
@@ -669,6 +942,15 @@ export class AriController {
   }
 
   private async teardown(channelId: string): Promise<void> {
+    const wt = this.waitingTimers.get(channelId);
+    if (wt) {
+      try {
+        clearTimeout(wt);
+      } catch {
+        /* ignore */
+      }
+      this.waitingTimers.delete(channelId);
+    }
     const leg = this.legs.get(channelId);
     this.claimed.delete(channelId);
     if (!leg) return;
@@ -698,6 +980,12 @@ export class AriController {
     }
     if (leg.role === "operator") {
       // Operator leaves: free only their channel, the emergency leg continues.
+      this.operatorProfiles.delete(leg.callId);
+      try {
+        this.hooks.onCallTeardown?.(leg.callId, leg.role, leg.bridgeId);
+      } catch {
+        /* hook must never break teardown */
+      }
       try {
         await this.rest("POST", `channels/${encodeURIComponent(channelId)}/hangup`);
       } catch (err) {
@@ -707,10 +995,27 @@ export class AriController {
       return;
     }
     // Caller leaves: clear joined operators first so nobody listens to dead air.
+    const callerCallId = leg.callId;
+    const bridgeId = leg.bridgeId;
     for (const [id, other] of [...this.legs]) {
-      if (other.role === "operator" && other.bridgeId === leg.bridgeId) {
+      if (other.role === "operator" && other.bridgeId === bridgeId) {
+        const w = this.waitingTimers.get(id);
+        if (w) {
+          try {
+            clearTimeout(w);
+          } catch {
+            /* ignore */
+          }
+          this.waitingTimers.delete(id);
+        }
         this.legs.delete(id);
         this.claimed.delete(id);
+        this.operatorProfiles.delete(other.callId);
+        try {
+          this.hooks.onCallTeardown?.(other.callId, other.role, bridgeId);
+        } catch {
+          /* ignore */
+        }
         try {
           await this.rest("POST", `channels/${encodeURIComponent(id)}/hangup`);
         } catch {
@@ -718,6 +1023,15 @@ export class AriController {
         }
         this.hooks.publish("call.ended", other.callId, { reason: "caller-left" });
       }
+    }
+    // Clear per-call caches (toggle entries live in conversation via the hook;
+    // profile entries live here).
+    this.operatorProfiles.delete(callerCallId);
+    this.operatorProfiles.delete(bridgeId);
+    try {
+      this.hooks.onCallTeardown?.(callerCallId, leg.role, bridgeId);
+    } catch {
+      /* ignore */
     }
     for (const [method, path] of [
       ["DELETE", `bridges/${leg.bridgeId}`],
@@ -740,6 +1054,14 @@ export class AriController {
     this.stopped = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
+    for (const [, t] of [...this.waitingTimers]) {
+      try {
+        clearTimeout(t);
+      } catch {
+        /* ignore */
+      }
+    }
+    this.waitingTimers.clear();
     for (const id of [...this.legs.keys()]) await this.teardown(id);
     try {
       this.ws?.close();

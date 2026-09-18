@@ -18,6 +18,7 @@ const MIGRATION = [
   "003_verification_sources.sql",
   "004_audit_log.sql",
   "005_operator_auth.sql",
+  "006_operator_profiles.sql",
 ]
   .map((f) => readFileSync(fileURLToPath(new URL(`../../../database/migrations/${f}`, import.meta.url)), "utf-8"))
   .join("\n");
@@ -44,7 +45,7 @@ beforeEach(async () => {
   // Operator/auth files are global to the sandbox: reset for determinism.
   const { rm } = await import("node:fs/promises");
   const dir = process.env.DATA_DIR as string;
-  for (const f of ["operators.json", "operator_sessions.json", "incident_sources.json", "audit_log.json"]) {
+  for (const f of ["operators.json", "operator_sessions.json", "incident_sources.json", "audit_log.json", "operator_profiles.json", "call_translation.json"]) {
     await rm(join(dir, f), { force: true });
   }
 });
@@ -252,5 +253,48 @@ describe("pgstore (Postgres backend)", () => {
     expect(b.immediate_danger_count).toBe(1);
     expect(b.average_latencies.total_ms).toBe(400);
     expect(computeAnalytics(await pgstore.getRecords({ limit: 500 }))).toEqual(b);
+  });
+
+  it("upserts operator profiles with file-store parity and mobile lookup", async () => {
+    for (const [s, tag] of [[file, "F"], [pgstore, "P"]] as const) {
+      const op = await s.createOperator({ name: `Prof ${tag}`, passwordHash: "h" });
+      const oid = String(op.id);
+      expect(await s.getOperatorProfile(oid)).toBeNull();
+      const created = await s.upsertOperatorProfile(oid, {
+        known_languages: ["hi-IN", "en-IN"],
+        default_language: "hi-IN",
+        mobile_e164: "91 98765 43210",
+      });
+      expect(created).toMatchObject({
+        operator_id: oid,
+        known_languages: ["hi-IN", "en-IN"],
+        default_language: "hi-IN",
+        mobile_e164: "+919876543210",
+        active: true,
+      });
+      // Partial patch keeps existing fields.
+      const patched = await s.upsertOperatorProfile(oid, { default_language: "mr-IN" });
+      expect(patched).toMatchObject({ default_language: "mr-IN", known_languages: ["hi-IN", "en-IN"] });
+      expect(await s.getOperatorProfile(oid)).toEqual(patched);
+      // Lookup normalizes spaces + missing plus on both write and query.
+      const hit = await s.findOperatorProfileByMobile("+91 98765 43210");
+      expect(hit?.operator_id).toBe(oid);
+      expect(hit).toMatchObject({ default_language: "mr-IN" });
+      expect(await s.findOperatorProfileByMobile("+910000000000")).toBeNull();
+    }
+    // Same semantics in both backends (ids differ — operators are per-backend).
+    const [a, b] = [await file.findOperatorProfileByMobile("+919876543210"), await pgstore.findOperatorProfileByMobile("91 98765 43210")];
+    expect(a).toMatchObject({ known_languages: ["hi-IN", "en-IN"], default_language: "mr-IN" });
+    expect(b).toMatchObject({ known_languages: ["hi-IN", "en-IN"], default_language: "mr-IN" });
+  });
+
+  it("toggles per-call translation with file-store parity and false default", async () => {
+    for (const s of [file, pgstore]) {
+      expect(await s.getCallTranslation("CALL-T1")).toEqual({ call_id: "CALL-T1", enabled: false });
+      expect(await s.setCallTranslation("CALL-T1", true)).toEqual({ call_id: "CALL-T1", enabled: true });
+      expect(await s.getCallTranslation("CALL-T1")).toEqual({ call_id: "CALL-T1", enabled: true });
+      expect(await s.setCallTranslation("CALL-T1", false)).toEqual({ call_id: "CALL-T1", enabled: false });
+    }
+    expect(await pgstore.getCallTranslation("CALL-T1")).toEqual(await file.getCallTranslation("CALL-T1"));
   });
 });

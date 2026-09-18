@@ -15,6 +15,7 @@ const MIGRATIONS = [
   "003_verification_sources.sql",
   "004_audit_log.sql",
   "005_operator_auth.sql",
+  "006_operator_profiles.sql",
 ];
 
 function pool() {
@@ -404,4 +405,109 @@ export async function appendDispatchEntry(entry: Doc): Promise<Doc[]> {
     );
   }
   return getDispatchLog();
+}
+
+/** Normalize to E.164-ish form: strip all whitespace, ensure leading +. */
+export function normalizeMobileE164(raw: unknown): string | null {
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).replace(/\s+/g, "").trim();
+  if (!s) return null;
+  return s.startsWith("+") ? s : `+${s}`;
+}
+
+function toPublicProfile(r: Doc): Doc {
+  let langs: unknown = r.known_languages;
+  if (typeof langs === "string") {
+    try {
+      langs = JSON.parse(langs);
+    } catch {
+      langs = [];
+    }
+  }
+  return {
+    operator_id: String(r.operator_id),
+    known_languages: Array.isArray(langs) ? langs : [],
+    default_language: String(r.default_language ?? "hi-IN"),
+    mobile_e164: r.mobile_e164 ?? null,
+    active: r.active !== false,
+  };
+}
+
+export async function getOperatorProfile(operatorId: string): Promise<Doc | null> {
+  await ensureSchema();
+  const res = await pool().query(
+    "SELECT operator_id, known_languages, default_language, mobile_e164, active FROM operator_profiles WHERE operator_id = $1 LIMIT 1",
+    [String(operatorId)],
+  );
+  return res.rows.length ? toPublicProfile(res.rows[0]) : null;
+}
+
+export interface OperatorProfilePatch {
+  known_languages?: string[];
+  default_language?: string;
+  mobile_e164?: string | null;
+}
+
+export async function upsertOperatorProfile(operatorId: string, patch: OperatorProfilePatch): Promise<Doc> {
+  await ensureSchema();
+  const oid = String(operatorId);
+  const existing = await getOperatorProfile(oid);
+  const known = patch.known_languages !== undefined ? [...patch.known_languages] : (existing?.known_languages ?? []);
+  const defLang =
+    patch.default_language !== undefined ? patch.default_language : (existing?.default_language ?? "hi-IN");
+  const mobile =
+    patch.mobile_e164 !== undefined ? normalizeMobileE164(patch.mobile_e164) : (existing?.mobile_e164 ?? null);
+  try {
+    const res = await pool().query(
+      `INSERT INTO operator_profiles (operator_id, known_languages, default_language, mobile_e164)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (operator_id) DO UPDATE SET
+         known_languages = EXCLUDED.known_languages,
+         default_language = EXCLUDED.default_language,
+         mobile_e164 = EXCLUDED.mobile_e164,
+         updated_at = now()
+       RETURNING operator_id, known_languages, default_language, mobile_e164, active`,
+      [oid, known, defLang, mobile],
+    );
+    return toPublicProfile(res.rows[0]);
+  } catch (err) {
+    if (/duplicate|unique/i.test(String(err))) throw new Error("mobile_taken");
+    throw err;
+  }
+}
+
+export async function findOperatorProfileByMobile(mobile: string): Promise<Doc | null> {
+  await ensureSchema();
+  const norm = normalizeMobileE164(mobile);
+  if (!norm) return null;
+  const res = await pool().query(
+    "SELECT operator_id, known_languages, default_language, mobile_e164, active FROM operator_profiles WHERE mobile_e164 = $1 LIMIT 1",
+    [norm],
+  );
+  return res.rows.length ? toPublicProfile(res.rows[0]) : null;
+}
+
+export async function getCallTranslation(callId: string): Promise<{ call_id: string; enabled: boolean }> {
+  await ensureSchema();
+  const res = await pool().query("SELECT call_id, enabled FROM call_translation WHERE call_id = $1 LIMIT 1", [
+    String(callId),
+  ]);
+  if (!res.rows.length) return { call_id: String(callId), enabled: false };
+  return { call_id: String(res.rows[0].call_id), enabled: Boolean(res.rows[0].enabled) };
+}
+
+export async function setCallTranslation(
+  callId: string,
+  enabled: boolean,
+): Promise<{ call_id: string; enabled: boolean }> {
+  await ensureSchema();
+  const cid = String(callId);
+  const flag = Boolean(enabled);
+  const res = await pool().query(
+    `INSERT INTO call_translation (call_id, enabled) VALUES ($1, $2)
+     ON CONFLICT (call_id) DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now()
+     RETURNING call_id, enabled`,
+    [cid, flag],
+  );
+  return { call_id: String(res.rows[0].call_id), enabled: Boolean(res.rows[0].enabled) };
 }

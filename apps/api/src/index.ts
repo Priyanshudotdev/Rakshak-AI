@@ -482,6 +482,123 @@ app.post("/api/operators/logout", async (req) => {
   return { status: "success", message: "Signed out" };
 });
 
+// Operator language profiles (gateway DID join identifies by caller ID) +
+// per-call live-translation toggle. Operator routes share the Bearer session
+// gate used by /api/translate and /api/dispatch (requireAuth), plus a strict
+// session check — the profile/translation actions need a session operator_id,
+// so unauthenticated callers always get 401 even when AUTH_REQUIRED is off.
+function normalizeMobileE164(raw: unknown): string | null {
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).replace(/\s+/g, "").trim();
+  if (!s) return null;
+  return s.startsWith("+") ? s : `+${s}`;
+}
+
+const profilePutSchema = z.object({
+  known_languages: z.array(z.string().min(1).max(30)).max(20).optional(),
+  default_language: z.string().min(1).max(30).optional(),
+  mobile_e164: z.string().max(30).nullable().optional(),
+});
+
+const translationSetSchema = z.object({ enabled: z.boolean() });
+
+async function requireOperator(
+  req: { headers: Record<string, string | string[] | undefined> },
+  reply: { code(n: number): { send(b: unknown): unknown } },
+): Promise<{ id: string; name?: string } | null> {
+  if (!(await requireAuth(req, reply))) return null;
+  const { authenticate } = await import("./auth.js");
+  const op = await authenticate(store, req.headers);
+  if (!op) {
+    reply.code(401).send({ status: "error", message: "Operator sign-in required" });
+    return null;
+  }
+  return op as { id: string; name?: string };
+}
+
+app.get("/api/operators/profile", async (req, reply) => {
+  const op = await requireOperator(req, reply);
+  if (!op) return;
+  const profile = await store.getOperatorProfile(String(op.id));
+  if (!profile) {
+    // Defaults, not an error: every operator starts without a profile and the
+    // dashboard prefill must not throw on first sign-in.
+    return {
+      operator_id: String(op.id),
+      known_languages: [],
+      default_language: "hi-IN",
+      mobile_e164: null,
+      active: true,
+    };
+  }
+  return profile;
+});
+
+app.put("/api/operators/profile", async (req, reply) => {
+  const op = await requireOperator(req, reply);
+  if (!op) return;
+  const parsed = profilePutSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ status: "error", message: "Invalid profile body" });
+  const patch: { known_languages?: string[]; default_language?: string; mobile_e164?: string | null } = {};
+  if (parsed.data.known_languages !== undefined) patch.known_languages = parsed.data.known_languages;
+  if (parsed.data.default_language !== undefined) patch.default_language = parsed.data.default_language;
+  if (parsed.data.mobile_e164 !== undefined) patch.mobile_e164 = normalizeMobileE164(parsed.data.mobile_e164);
+  try {
+    return await store.upsertOperatorProfile(String(op.id), patch);
+  } catch (err) {
+    if (/mobile_taken|duplicate|unique/i.test(String(err))) {
+      return reply.code(409).send({ status: "error", message: "mobile already in use" });
+    }
+    const e = serverError(err);
+    return reply.code(e.code).send(e.body);
+  }
+});
+
+// Gateway DID join lookup: shared-secret gate mirroring POST /api/events/publish
+// (open in dev when EVENT_INGEST_KEY is unset).
+app.get("/api/operators/lookup", async (req, reply) => {
+  const required = process.env.EVENT_INGEST_KEY;
+  if (required && req.headers["x-ingest-key"] !== required) {
+    return reply.code(401).send({ status: "error", message: "Unauthorized" });
+  }
+  const q = req.query as { mobile?: string };
+  const norm = normalizeMobileE164(q.mobile ?? "");
+  if (!norm) return reply.code(400).send({ status: "error", message: "mobile is required" });
+  const hit = await store.findOperatorProfileByMobile(norm);
+  if (!hit) return reply.code(404).send({ status: "not_found" });
+  return {
+    operator_id: hit.operator_id,
+    default_language: hit.default_language,
+    known_languages: hit.known_languages,
+  };
+});
+
+app.get("/api/calls/:id/translation", async (req, reply) => {
+  const op = await requireOperator(req, reply);
+  if (!op) return;
+  const { id } = req.params as { id: string };
+  return store.getCallTranslation(id);
+});
+
+app.post("/api/calls/:id/translation", async (req, reply) => {
+  const op = await requireOperator(req, reply);
+  if (!op) return;
+  const { id } = req.params as { id: string };
+  const parsed = translationSetSchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ status: "error", message: "enabled is required" });
+  const result = await store.setCallTranslation(id, parsed.data.enabled);
+  try {
+    publishEvent("translation.toggled" as never, id, {
+      call_id: id,
+      enabled: result.enabled,
+      by: String(op.id),
+    });
+  } catch (err) {
+    log("warn", "translation.toggled emit failed", { err: String(err) });
+  }
+  return result;
+});
+
 app.get("/api/audit", async (req) => {
   const q = req.query as { limit?: string };
   const limit = Math.max(1, Math.min(Number(q.limit ?? 50) || 50, 500));

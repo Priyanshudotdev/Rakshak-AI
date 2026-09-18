@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   audioUrl,
@@ -8,7 +8,9 @@ import {
   getAnalytics,
   getDispatchLog,
   getHealth,
+  getProfile,
   getRecordCount,
+  getTranslation,
   listRecords,
   login,
   logout,
@@ -16,15 +18,17 @@ import {
   postDispatch,
   processAudioFile,
   processCall,
+  putProfile,
   register,
   setOperatorName,
+  setTranslation,
   signedInOperator,
   synthesize,
   translate,
   type ListenVoice,
 } from "../lib/api";
 import type { LiveEvent } from "../lib/live";
-import { useLiveEvents } from "../lib/live";
+import { activeLiveCallId, translationSuggestionForCall, useLiveEvents } from "../lib/live";
 import { summarizeVerification } from "../lib/verification";
 import type { DispatchEntry, IncidentRecord } from "../lib/types";
 import {
@@ -564,7 +568,9 @@ function OperatorListen({ feed }: { feed: { events: LiveEvent[] } }) {
   const [error, setError] = useState<string | null>(null);
   const [src, setSrc] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
-  const latest = feed.events.find((e) => e.name === "transcript.final");
+  const activeCallId = activeLiveCallId(feed.events);
+  const latest = feed.events.find((e) => e.name === "transcript.final" && e.callId === activeCallId)
+    ?? feed.events.find((e) => e.name === "transcript.final");
   const payload = (latest?.payload ?? {}) as { original_text?: string; language?: string };
   const text = payload.original_text ?? "";
   return (
@@ -627,6 +633,268 @@ function OperatorListen({ feed }: { feed: { events: LiveEvent[] } }) {
           <p className="mt-1 text-xs text-red-400">{error}</p>
         ) : null}
         {src ? <audio ref={audioRef} className="mt-2 w-full" controls preload="none" src={src} /> : null}
+      </CardBody>
+    </Card>
+  );
+}
+
+/* ---------------- Operator profile ---------------- */
+
+export const PROFILE_LANGUAGES = [
+  "mr-IN",
+  "hi-IN",
+  "en-IN",
+  "gu-IN",
+  "ta-IN",
+  "te-IN",
+  "kn-IN",
+  "ml-IN",
+  "bn-IN",
+] as const;
+
+/** Re-reads the signed-in operator so the profile card appears/disappears as
+ *  the DispatchPanel signs in/out in the same tab (storage events don't fire
+ *  same-tab, so also sync on focus + a light poll). */
+function useSignedInOperator() {
+  const [session, setSession] = useState(signedInOperator);
+  useEffect(() => {
+    const sync = () => setSession(signedInOperator());
+    sync();
+    window.addEventListener("storage", sync);
+    window.addEventListener("focus", sync);
+    const t = setInterval(sync, 2000);
+    return () => {
+      window.removeEventListener("storage", sync);
+      window.removeEventListener("focus", sync);
+      clearInterval(t);
+    };
+  }, []);
+  return session;
+}
+
+export function OperatorProfile() {
+  const session = useSignedInOperator();
+  const qc = useQueryClient();
+  const profile = useQuery({
+    queryKey: ["profile"],
+    queryFn: getProfile,
+    enabled: !!session,
+    refetchOnWindowFocus: false,
+  });
+  const [known, setKnown] = useState<string[]>([]);
+  const [defaultLang, setDefaultLang] = useState<string>("mr-IN");
+  const [mobile, setMobile] = useState("");
+  const [hydrated, setHydrated] = useState(false);
+
+  useEffect(() => {
+    if (profile.data && !hydrated) {
+      setKnown(profile.data.known_languages ?? []);
+      setDefaultLang(profile.data.default_language ?? "mr-IN");
+      setMobile(profile.data.mobile_e164 ?? "");
+      setHydrated(true);
+    }
+  }, [profile.data, hydrated]);
+
+  useEffect(() => {
+    if (!session) setHydrated(false);
+  }, [session]);
+
+  const save = useMutation({
+    mutationFn: () => putProfile({ known_languages: known, default_language: defaultLang, mobile_e164: mobile }),
+    onSuccess: async (updated) => {
+      setKnown(updated.known_languages ?? []);
+      setDefaultLang(updated.default_language ?? defaultLang);
+      setMobile(updated.mobile_e164 ?? "");
+      await qc.invalidateQueries({ queryKey: ["profile"] });
+    },
+  });
+
+  if (!session) return null;
+
+  const toggleLang = (code: string) =>
+    setKnown((prev) => (prev.includes(code) ? prev.filter((l) => l !== code) : [...prev, code]));
+
+  return (
+    <Card>
+      <CardHead
+        title="Operator profile"
+        sub={session ? `Signed in as ${session.name}` : "Languages + contact for translation"}
+        right={profile.data?.active === false ? <Badge tone="warn">inactive</Badge> : null}
+      />
+      <CardBody>
+        {profile.isPending ? (
+          <div className="flex items-center gap-2 text-sm text-muted">
+            <Spinner /> Loading profile…
+          </div>
+        ) : profile.isError ? (
+          <Alert kind="error">Couldn&apos;t load profile — check the API and retry.</Alert>
+        ) : (
+          <div className="space-y-3">
+            <Field label="Known languages">
+              <div className="flex flex-wrap gap-1.5">
+                {PROFILE_LANGUAGES.map((code) => {
+                  const on = known.includes(code);
+                  return (
+                    <button
+                      key={code}
+                      type="button"
+                      data-testid={`lang-chip-${code}`}
+                      aria-pressed={on}
+                      onClick={() => toggleLang(code)}
+                      className={`rounded-full border px-2.5 py-1 font-mono text-xs transition-colors ${
+                        on
+                          ? "border-accent bg-accent text-white"
+                          : "border-line bg-ink text-muted hover:text-cream"
+                      }`}
+                    >
+                      {code}
+                    </button>
+                  );
+                })}
+              </div>
+            </Field>
+            <Field label="Default language">
+              <SelectInput value={defaultLang} onChange={(e) => setDefaultLang(e.target.value)} aria-label="Default language">
+                {PROFILE_LANGUAGES.map((code) => (
+                  <option key={code} value={code}>
+                    {code}
+                  </option>
+                ))}
+              </SelectInput>
+            </Field>
+            <Field label="Mobile (E164)">
+              <TextInput
+                value={mobile}
+                onChange={(e) => setMobile(e.target.value)}
+                placeholder="+911234567890"
+                inputMode="tel"
+                aria-label="Mobile (E164)"
+              />
+            </Field>
+            {save.isError ? (
+              <Alert kind="error">{save.error instanceof Error ? save.error.message : "Save failed."}</Alert>
+            ) : null}
+            {save.isSuccess ? <Alert kind="ok">Profile saved.</Alert> : null}
+            <Button disabled={save.isPending} onClick={() => save.mutate()} className="w-full">
+              {save.isPending ? <Spinner /> : null} Save profile
+            </Button>
+          </div>
+        )}
+      </CardBody>
+    </Card>
+  );
+}
+
+/* ---------------- Live translation (toggle + nudge) ---------------- */
+
+export function TranslationToggle({
+  enabled,
+  pending,
+  disabled,
+  onToggle,
+}: {
+  enabled: boolean;
+  pending?: boolean;
+  disabled?: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <Button onClick={onToggle} disabled={disabled || pending} variant={enabled ? "primary" : "ghost"} aria-pressed={enabled}>
+      {pending ? <Spinner /> : null} Translation: {enabled ? "ON" : "OFF"}
+    </Button>
+  );
+}
+
+export function NudgeBanner({
+  callerLanguage,
+  pending,
+  onEnable,
+}: {
+  callerLanguage: string;
+  pending?: boolean;
+  onEnable: () => void;
+}) {
+  return (
+    <div role="alert" className="mt-3 rounded-md2 border border-priomed/40 bg-priomed/10 p-2.5">
+      <p className="text-sm text-cream">Caller speaks {callerLanguage} — enable translation?</p>
+      <div className="mt-2">
+        <Button onClick={onEnable} disabled={pending}>
+          {pending ? <Spinner /> : null} Enable
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+export function LiveTranslationPanel({ feed }: { feed: { events: LiveEvent[] } }) {
+  const callId = activeLiveCallId(feed.events);
+  const qc = useQueryClient();
+  const state = useQuery({
+    queryKey: ["translation", callId],
+    queryFn: () => getTranslation(callId as string),
+    enabled: !!callId,
+    refetchInterval: 5000,
+    refetchOnWindowFocus: false,
+  });
+  const [optimistic, setOptimistic] = useState<boolean | null>(null);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setOptimistic(null);
+    setError(null);
+    setPending(false);
+  }, [callId]);
+
+  const enabled = optimistic ?? state.data?.enabled ?? false;
+  const suggestion = translationSuggestionForCall(feed.events, callId);
+  const showNudge = !!callId && !!suggestion && !enabled;
+
+  const flip = async (next?: boolean) => {
+    if (!callId || pending) return;
+    const target = next ?? !enabled;
+    const prev = enabled;
+    setOptimistic(target);
+    setPending(true);
+    setError(null);
+    try {
+      const res = await setTranslation(callId, target);
+      qc.setQueryData(["translation", callId], res);
+      setOptimistic(null);
+    } catch (e) {
+      setOptimistic(prev);
+      setError(e instanceof Error ? e.message : "Translation update failed");
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHead
+        title="Live translation"
+        sub={callId ? `Per-call toggle · ${callId}` : "Waiting for a live call"}
+        right={<Badge tone={enabled ? "ok" : "neutral"}>{enabled ? "on" : "off"}</Badge>}
+      />
+      <CardBody>
+        {!callId ? (
+          <EmptyState title="No live call" sub="Latest transcript.final sets the active call for translation." />
+        ) : (
+          <>
+            <div className="flex flex-wrap items-center gap-2">
+              <TranslationToggle enabled={enabled} pending={pending || state.isPending} onToggle={() => void flip()} />
+              <span className="font-mono text-xs text-muted">{callId}</span>
+            </div>
+            {error ? (
+              <div className="mt-2">
+                <Alert kind="error">{error}</Alert>
+              </div>
+            ) : null}
+            {showNudge && suggestion ? (
+              <NudgeBanner callerLanguage={suggestion.callerLanguage} pending={pending} onEnable={() => void flip(true)} />
+            ) : null}
+          </>
+        )}
       </CardBody>
     </Card>
   );
@@ -766,7 +1034,9 @@ export function OpsConsole() {
           <div className="space-y-4">
             <IntakePanel onDone={(id) => setSelectedId(id)} />
             <LivePanel feed={feed} />
+            <LiveTranslationPanel feed={feed} />
             <OperatorListen feed={feed} />
+            <OperatorProfile />
             <DispatchPanel />
           </div>
           <RecordsPanel selectedId={selectedId} onSelect={(id) => setSelectedId(id)} />
