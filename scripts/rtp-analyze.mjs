@@ -14,6 +14,11 @@ if (!path) {
 }
 const buf = readFileSync(path);
 if (buf.readUInt32LE(0) !== 0xa1b2c3d4) throw new Error("not a little-endian pcap");
+// Link-layer header size depends on the capture interface:
+// `-i any` gives LINUX_SLL2 (20B), `-i lo`/`-i eth0` give Ethernet (14B).
+const linktype = buf.readUInt32LE(20);
+const l2len = linktype === 1 ? 14 : linktype === 101 ? 16 : linktype === 113 ? 20 : null;
+if (l2len === null) throw new Error(`unsupported pcap linktype ${linktype}`);
 
 // Collect RTP payloads -> destination wantPort.
 const payloads = [];
@@ -23,7 +28,7 @@ while (off + 16 <= buf.length) {
   let p = off + 16;
   const end = p + incl;
   if (end > buf.length) break;
-  p += 20; // LINUX_SLL2 cooked header
+  p += l2len;
   const ihl = (buf[p] & 0x0f) * 4;
   const proto = buf[p + 9];
   p += ihl;
