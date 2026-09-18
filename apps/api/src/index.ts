@@ -202,7 +202,20 @@ app.delete("/api/records/:id", async (req, reply) => {
   return { status: "success", message: "Record deleted" };
 });
 
-app.get("/api/analytics", async () => ({ status: "success", data: await store.getAnalytics() }));
+  // Short TTL cache: the dashboard polls this on an interval from several
+  // panels at once, and getAnalytics scans hundreds of records per call.
+  // Without it a slow scan overlaps the next poll and the UI flaps between
+  // data and skeletons. 8s staleness is invisible on a dashboard.
+  let analyticsCache: { at: number; body: unknown } | null = null;
+  app.get("/api/analytics", async () => {
+    const now = Date.now();
+    if (analyticsCache && now - analyticsCache.at < 8000) {
+      return { status: "success", data: analyticsCache.body };
+    }
+    const data = await store.getAnalytics();
+    analyticsCache = { at: now, body: data };
+    return { status: "success", data };
+  });
 
 const ttsSchema = z.object({
   text: z.string().min(1, "Text is required"),

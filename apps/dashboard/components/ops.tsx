@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   audioUrl,
   clearRecords,
@@ -187,10 +187,15 @@ function IntakePanel({ onDone }: { onDone: (id: string) => void }) {
 /* ---------------- Analytics strip ---------------- */
 
 function AnalyticsStrip() {
-  const { data, isPending } = useQuery({
+  // keepPreviousData: background refetches/errors keep stale stats on screen.
+  // Without it every 5s poll (or transient API error) swaps stats for
+  // skeletons and back — the reported "blinking". Skeletons show on first
+  // load only now. Interval raised: WS invalidation covers live updates.
+  const { data } = useQuery({
     queryKey: ["analytics"],
     queryFn: async () => (await getAnalytics()).data,
-    refetchInterval: 5000,
+    refetchInterval: 15_000,
+    placeholderData: keepPreviousData,
   });
   const stats: Array<[string, string]> = data
     ? [
@@ -203,10 +208,10 @@ function AnalyticsStrip() {
       ]
     : [];
   return (
-    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
-      {isPending
+    <div className="grid min-h-[68px] grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
+      {!data
         ? Array.from({ length: 6 }).map((_, i) => (
-            <div key={i} className="h-[68px] animate-pulse rounded-lg2 border border-line bg-surface" />
+            <div key={i} className="h-[68px] rounded-lg2 border border-line bg-surface" />
           ))
         : stats.map(([k, v]) => (
             <div key={k} className="rounded-lg2 border border-line bg-surface px-4 py-3">
@@ -245,7 +250,8 @@ export function RecordsPanel({
           limit: 50,
         })
       ).data,
-    refetchInterval: 4000,
+    refetchInterval: 8000,
+    placeholderData: keepPreviousData,
   });
 
   const clearAll = useMutation({
@@ -725,7 +731,12 @@ export const PROFILE_LANGUAGES = [
 function useSignedInOperator() {
   const [session, setSession] = useState(signedInOperator);
   useEffect(() => {
-    const sync = () => setSession(signedInOperator());
+    // Compare before set: signedInOperator() builds a fresh object every call,
+    // and a blind set re-renders the whole console on every poll.
+    const sync = () => {
+      const next = signedInOperator();
+      setSession((prev) => (prev?.name === next?.name && prev?.role === next?.role ? prev : next));
+    };
     sync();
     window.addEventListener("storage", sync);
     window.addEventListener("focus", sync);
@@ -902,6 +913,7 @@ export function LiveTranslationPanel({ feed }: { feed: { events: LiveEvent[] } }
     enabled: !!callId,
     refetchInterval: 5000,
     refetchOnWindowFocus: false,
+    placeholderData: keepPreviousData,
   });
   const [optimistic, setOptimistic] = useState<boolean | null>(null);
   const [pending, setPending] = useState(false);
@@ -970,7 +982,12 @@ export function LiveTranslationPanel({ feed }: { feed: { events: LiveEvent[] } }
 /* ---------------- Dispatch log ---------------- */
 
 function DispatchPanel() {
-  const { data, isPending } = useQuery({ queryKey: ["dispatch"], queryFn: getDispatchLog, refetchInterval: 5000 });
+  const { data, isPending } = useQuery({
+    queryKey: ["dispatch"],
+    queryFn: getDispatchLog,
+    refetchInterval: 15_000,
+    placeholderData: keepPreviousData,
+  });
   const log: DispatchEntry[] = Array.isArray(data) ? data : [];
   const [callsign, setCallsign] = useState(operatorName());
   const [session, setSession] = useState(signedInOperator());
@@ -1082,11 +1099,12 @@ function DispatchPanel() {
 export function OpsConsole() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const feed = useLiveEvents();
-  const count = useQuery({ queryKey: ["count"], queryFn: getRecordCount, refetchInterval: 4000 });
+  const count = useQuery({ queryKey: ["count"], queryFn: getRecordCount, refetchInterval: 8000, placeholderData: keepPreviousData });
   const records = useQuery({
     queryKey: ["records", "", "ALL", ""],
     queryFn: async () => (await listRecords({ priority: "ALL", limit: 50 })).data,
-    refetchInterval: 4000,
+    refetchInterval: 8000,
+    placeholderData: keepPreviousData,
   });
   const selected: IncidentRecord | null = selectedId
     ? (records.data?.find((r) => r.id === selectedId) ?? null)
