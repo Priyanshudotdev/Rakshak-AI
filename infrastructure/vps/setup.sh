@@ -155,26 +155,32 @@ grep -q "external_media_address = $PUBLIC_IP" /etc/asterisk/pjsip.conf \
   && grep -q "external_signaling_address = $PUBLIC_IP" /etc/asterisk/pjsip.conf \
   && log "OK pjsip.conf carries external=$PUBLIC_IP" \
   || { echo "[setup] FAIL: VPS overrides missing in pjsip.conf" >&2; fail=1; }
-asterisk -rx "pjsip show transports" | grep -q "transport-udp" \
+# arix: single `asterisk -rx` invocations intermittently return empty on a
+# freshly restarted 1-vCPU box while the identical command succeeds seconds
+# apart (observed across three different checks). Retry, then evaluate.
+arix() {
+  local i out
+  for i in 1 2 3 4; do
+    out=$(asterisk -rx "$1" 2>/dev/null || true)
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out"
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+t_out=$(arix "pjsip show transports" || true)
+printf '%s' "$t_out" | grep -q "transport-udp" \
   && log "OK transport-udp loaded" \
   || { echo "[setup] FAIL: transport-udp not loaded" >&2; fail=1; }
-# Endpoint check, retried: a single `asterisk -rx` invocation can hiccup on a
-# freshly restarted box while the identical command succeeds seconds apart
-# (observed: diagnostics list the endpoints, the immediate re-check misses).
-# Match on the InAuth lines — unique, single-space, no format ambiguity.
-endpoints_ok=0
-for i in 1 2 3; do
-  eps=$(asterisk -rx "pjsip show endpoints" || true)
-  if printf '%s' "$eps" | grep -q "1001-auth" && printf '%s' "$eps" | grep -q "1002-auth"; then
-    endpoints_ok=1
-    break
-  fi
-  sleep 5
-done
-[ "$endpoints_ok" -eq 1 ] \
+# Match endpoints on the InAuth lines — unique, single-space, no format ambiguity.
+e_out=$(arix "pjsip show endpoints" || true)
+printf '%s' "$e_out" | grep -q "1001-auth" && printf '%s' "$e_out" | grep -q "1002-auth" \
   && log "OK endpoints 1001/1002 present" \
   || { echo "[setup] FAIL: endpoints 1001/1002 missing" >&2; fail=1; }
-asterisk -rx "dialplan show rakshak-incoming" | grep -q "Stasis" \
+d_out=$(arix "dialplan show rakshak-incoming" || true)
+printf '%s' "$d_out" | grep -q "Stasis" \
   && log "OK dialplan rakshak-incoming hands to Stasis" \
   || { echo "[setup] FAIL: dialplan broken" >&2; fail=1; }
 
