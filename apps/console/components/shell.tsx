@@ -19,6 +19,8 @@ import { useRouter } from "next/navigation";
 import {
   Bell,
   Buildings,
+  CaretDoubleLeft,
+  CaretDoubleRight,
   ChartBar,
   ClockCounterClockwise,
   FolderOpen,
@@ -196,9 +198,12 @@ function ConnectionBadge({ status }: { status?: ConnectionStatus }) {
 function SidebarBody({
   section,
   onNavigate,
+  collapsed = false,
 }: {
   section: ShellSection;
   onNavigate?: () => void;
+  /** Icon-only sliding mode (desktop collapse). Labels become tooltips. */
+  collapsed?: boolean;
 }) {
   const { org, update } = useOrg();
   const operator = useOperator();
@@ -209,6 +214,7 @@ function SidebarBody({
 
   return (
     <div className="flex h-full flex-col">
+      {collapsed ? null : (
       <div className="border-b border-line px-4 py-3">
         <label
           htmlFor="workspace-selector"
@@ -233,8 +239,9 @@ function SidebarBody({
         </select>
         <p className="mt-1 text-[11px] text-faint">Local-only placeholder, not synced.</p>
       </div>
+      )}
 
-      <nav aria-label="Primary" className="flex-1 overflow-y-auto px-2 py-3">
+      <nav aria-label="Primary" className={`flex-1 overflow-y-auto py-3 ${collapsed ? "px-2" : "px-2"}`}>
         <ul className="space-y-1">
           {NAV.map(({ section: s, label, href, Icon }) => {
             const active = s === section;
@@ -242,16 +249,20 @@ function SidebarBody({
               <li key={s}>
                 <Link
                   href={href}
+                  title={label}
+                  aria-label={label}
                   aria-current={active ? "page" : undefined}
                   onClick={onNavigate}
                   className={`flex min-h-[40px] items-center gap-3 rounded-xl2 px-3 text-sm font-medium transition-colors ${
+                    collapsed ? "justify-center px-0" : ""
+                  } ${
                     active
                       ? "bg-primary-soft text-primary-dark"
                       : "text-muted hover:bg-paper hover:text-ink"
                   }`}
                 >
                   <Icon aria-hidden weight={active ? "fill" : "regular"} className="h-5 w-5 shrink-0" />
-                  {label}
+                  {collapsed ? null : label}
                 </Link>
               </li>
             );
@@ -259,8 +270,8 @@ function SidebarBody({
         </ul>
       </nav>
 
-      <div className="border-t border-line p-3">
-        <div className="flex items-center gap-3">
+      <div className="relative border-t border-line p-3">
+        <div className={`flex items-center gap-3 ${collapsed ? "flex-col gap-2" : ""}`}>
           <span className="relative inline-flex shrink-0">
             <span
               aria-hidden
@@ -274,12 +285,14 @@ function SidebarBody({
               className={`absolute -bottom-0.5 -right-0.5 h-3.5 w-3.5 rounded-full ring-2 ring-card ${AVAILABILITY_DOT[availability]}`}
             />
           </span>
+          {collapsed ? null : (
           <div className="min-w-0 flex-1">
             <p className="truncate text-sm font-semibold text-ink">{operator?.name ?? "Operator"}</p>
             <p className="truncate text-xs text-muted">
               {operator?.role ?? "operator"} · {availability}
             </p>
           </div>
+          )}
           <button
             type="button"
             aria-expanded={menuOpen}
@@ -296,7 +309,15 @@ function SidebarBody({
           </button>
         </div>
         {menuOpen ? (
-          <div role="menu" aria-label="Account" className="mt-2 rounded-xl2 border border-line bg-card p-1.5">
+          <div
+            role="menu"
+            aria-label="Account"
+            className={
+              collapsed
+                ? "absolute bottom-full left-2 z-50 mb-2 w-52 rounded-xl2 border border-line bg-card p-1.5 shadow-card"
+                : "mt-2 rounded-xl2 border border-line bg-card p-1.5"
+            }
+          >
             <button
               type="button"
               role="menuitem"
@@ -467,7 +488,27 @@ export function Shell({
   children: React.ReactNode;
 }) {
   const [drawer, setDrawer] = React.useState(false);
+  const [collapsed, setCollapsed] = React.useState(false);
   const closeRef = React.useRef<HTMLButtonElement>(null);
+
+  React.useEffect(() => {
+    try {
+      setCollapsed(localStorage.getItem("rakshak.console.navCollapsed") === "1");
+    } catch {
+      /* keep expanded */
+    }
+  }, []);
+
+  const toggleCollapsed = React.useCallback(() => {
+    setCollapsed((v) => {
+      try {
+        localStorage.setItem("rakshak.console.navCollapsed", v ? "0" : "1");
+      } catch {
+        /* private mode */
+      }
+      return !v;
+    });
+  }, []);
 
   React.useEffect(() => {
     if (!drawer) return;
@@ -486,37 +527,14 @@ export function Shell({
 
   return (
     <div className="flex min-h-dvh bg-paper text-ink">
-      {/* icon rail (desktop) */}
-      <div className="hidden w-14 shrink-0 flex-col items-center gap-1 border-r border-line bg-card py-3 lg:flex">
-        <nav aria-label="Primary">
-          <ul className="space-y-1">
-            {NAV.map(({ section: s, label, href, Icon }) => {
-              const active = s === section;
-              return (
-                <li key={s}>
-                  <Link
-                    href={href}
-                    title={label}
-                    aria-label={label}
-                    aria-current={active ? "page" : undefined}
-                    className={`flex h-10 w-10 items-center justify-center rounded-xl2 transition-colors ${
-                      active
-                        ? "bg-primary-soft text-primary-dark"
-                        : "text-muted hover:bg-paper hover:text-ink"
-                    }`}
-                  >
-                    <Icon aria-hidden weight={active ? "fill" : "regular"} className="h-5 w-5" />
-                  </Link>
-                </li>
-              );
-            })}
-          </ul>
-        </nav>
-      </div>
-
-      {/* sidebar (desktop) */}
-      <aside aria-label="Workspace and navigation" className="hidden w-60 shrink-0 border-r border-line bg-card lg:block">
-        <SidebarBody section={section} />
+      {/* single sliding sidebar (desktop): expanded labels <-> collapsed icons */}
+      <aside
+        aria-label="Workspace and navigation"
+        className={`sticky top-0 hidden h-dvh shrink-0 border-r border-line bg-card transition-[width] duration-200 ease-out lg:block ${
+          collapsed ? "w-[68px]" : "w-60"
+        }`}
+      >
+        <SidebarBody section={section} collapsed={collapsed} />
       </aside>
 
       {/* mobile drawer */}
@@ -565,6 +583,20 @@ export function Shell({
               className="inline-flex h-10 w-10 items-center justify-center rounded-xl2 text-muted hover:bg-paper hover:text-ink lg:hidden"
             >
               <List aria-hidden weight="bold" className="h-5 w-5" />
+            </button>
+            <button
+              type="button"
+              aria-label={collapsed ? "Expand navigation" : "Collapse navigation"}
+              aria-expanded={!collapsed}
+              onClick={toggleCollapsed}
+              title={collapsed ? "Expand navigation" : "Collapse navigation"}
+              className="hidden h-10 w-10 items-center justify-center rounded-xl2 text-muted hover:bg-paper hover:text-ink lg:inline-flex"
+            >
+              {collapsed ? (
+                <CaretDoubleRight aria-hidden weight="bold" className="h-5 w-5" />
+              ) : (
+                <CaretDoubleLeft aria-hidden weight="bold" className="h-5 w-5" />
+              )}
             </button>
             <div className="min-w-0 flex-1">
               {crumbs.length > 0 ? (
