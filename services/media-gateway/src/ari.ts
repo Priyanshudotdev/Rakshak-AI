@@ -35,7 +35,7 @@ export interface AriHooks {
   log(level: string, msg: string, fields?: Record<string, unknown>): void;
   adapter: RealtimeAdapter;
   /** Full-loop handler: incident extraction + spoken reply for final transcripts. */
-  onFinalTranscript?: (callId: string, text: string, language: string | undefined, role: LegRole) => void;
+  onFinalTranscript?: (callId: string, text: string, language: string | undefined, role: LegRole, confidence?: number) => void;
   /** Synthesize speech in the given language code. Returns wav bytes (or null). */
   synthesize?: (text: string, languageCode?: string) => Promise<Buffer | null>;
 }
@@ -374,10 +374,10 @@ export class AriController {
     const saaras = await this.hooks.adapter.connect(callId, {
       onPartial: (text, language) =>
         this.hooks.publish("transcript.partial", callId, { original_text: text, language: language ?? "Unknown", role }),
-      onFinal: (text, language) => {
-        this.hooks.publish("transcript.final", callId, { original_text: text, language: language ?? "Unknown", role });
+      onFinal: (text, language, confidence) => {
+        this.hooks.publish("transcript.final", callId, { original_text: text, language: language ?? "Unknown", role, confidence });
         try {
-          this.hooks.onFinalTranscript?.(callId, text, language, role);
+          this.hooks.onFinalTranscript?.(callId, text, language, role, confidence);
         } catch (err) {
           this.hooks.log("warn", "final handler failed", { callId, err: String(err) });
         }

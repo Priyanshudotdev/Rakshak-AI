@@ -247,8 +247,8 @@ if (adapter.kind === "saaras-realtime") {
       log,
       adapter,
       synthesize: synthesizeSpeech,
-    onFinalTranscript: (callId, text, language, role) => {
-      void handleFinal(callId, text, language, role ?? "caller");
+    onFinalTranscript: (callId, text, language, role, confidence) => {
+      void handleFinal(callId, text, language, role ?? "caller", confidence);
     },
     },
     {},

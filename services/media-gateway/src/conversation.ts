@@ -48,6 +48,9 @@ export function replyVoice(language?: string): { code: string; ack: string; conf
   };
 }
 
+/** Below this detection confidence we don't trust a language switch. */
+const MIN_LANG_CONFIDENCE = 0.6;
+
 export function createConversation(deps: ConversationDeps) {
   const fetchFn = deps.fetchFn ?? fetch;
   /** Last detected language per call — routes operator speech toward it. */
@@ -75,10 +78,19 @@ export function createConversation(deps: ConversationDeps) {
     }
   }
 
-  async function handleFinal(callId: string, text: string, language: string | undefined, role: string): Promise<void> {
+  async function handleFinal(callId: string, text: string, language: string | undefined, role: string, confidence?: number): Promise<void> {
     const ari = deps.ari();
     if (!ari || !text.trim()) return;
-    if (language) langByCall.set(callId, language);
+    // Sarvam misdetects tongues on noisy lines (observed: Marathi caller read
+    // as en-IN @ 0.4). Below-confidence guesses fall back to the call's
+    // established tongue, else the Marathi default — never a shaky first guess.
+    const prior = langByCall.get(callId);
+    let effLang = language;
+    if (language && confidence !== undefined && confidence < MIN_LANG_CONFIDENCE) {
+      effLang = prior ?? "Marathi";
+      deps.log("info", "language fallback", { callId, detected: language, confidence, using: effLang });
+    }
+    if (effLang) langByCall.set(callId, effLang);
     const channelId = ari.channelForCall(callId);
     if (!channelId) return;
     if (role === "operator") {
@@ -86,16 +98,16 @@ export function createConversation(deps: ConversationDeps) {
       const callerLang = (peer && langByCall.get(peer.callId)) || "Marathi";
       const callerChannel = peer ? ari.channelForCall(peer.callId) : null;
       if (!callerChannel) return;
-      await translateAndSpeak(callerChannel, text, replyVoice(callerLang).code, language);
+      await translateAndSpeak(callerChannel, text, replyVoice(callerLang).code, effLang);
       return;
     }
-    const voice = replyVoice(language);
+    const voice = replyVoice(effLang);
     try {
       await speak(channelId, voice.ack, voice.code);
       const res = await fetchFn(`${deps.apiUrl}/api/process-call`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transcript: text, language: language ?? "Marathi" }),
+        body: JSON.stringify({ transcript: text, language: effLang ?? "Marathi" }),
       });
       if (res.ok) {
         const body = (await res.json()) as {
@@ -107,7 +119,7 @@ export function createConversation(deps: ConversationDeps) {
       const peer = ari.bridgePeer(callId);
       if (peer && peer.role === "operator") {
         const opChannel = ari.channelForCall(peer.callId);
-        if (opChannel) await translateAndSpeak(opChannel, text, deps.operatorLang, language);
+        if (opChannel) await translateAndSpeak(opChannel, text, deps.operatorLang, effLang);
       }
     } catch (err) {
       deps.log("warn", "final-loop failed", { callId, err: String(err) });

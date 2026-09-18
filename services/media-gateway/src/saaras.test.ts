@@ -89,9 +89,9 @@ describe("SaarasRealtimeAdapter", () => {
     expect(Buffer.from(frame.audio, "base64")).toEqual(Buffer.from([1, 2, 3]));
 
     socket!.emit("message", JSON.stringify({ event: "transcript.partial", text: "aag", language: "mr-IN" }));
-    socket!.emit("message", JSON.stringify({ event: "transcript.final", text: "aag lagli", language: "mr-IN" }));
+    socket!.emit("message", JSON.stringify({ event: "transcript.final", text: "aag lagli", language: "mr-IN", language_confidence: 0.9 }));
     expect(cb.onPartial).toHaveBeenCalledWith("aag", "mr-IN");
-    expect(cb.onFinal).toHaveBeenCalledWith("aag lagli", "mr-IN");
+    expect(cb.onFinal).toHaveBeenCalledWith("aag lagli", "mr-IN", 0.9);
 
     session.close();
     expect(JSON.parse(socket!.sent.at(-1)!)).toEqual({ event: "end" });

@@ -116,4 +116,17 @@ describe("two-way translated conversation", () => {
     expect(plays).toHaveLength(0);
     expect(fetchCalls).toHaveLength(0);
   });
+
+  it("shaky first detection falls back to Marathi, confident later final switches", async () => {
+    const { conv, plays } = setup();
+    await conv.handleFinal("CALLER", "aag lagli aahe", "en-IN", "caller", 0.4);
+    const first = plays.filter((p) => p.channel === "chan-caller");
+    expect(first[0].code).toBe("mr-IN");
+    expect(first[0].text).toContain("माहिती मिळाली");
+    await conv.handleFinal("CALLER", "there is a fire", "en-IN", "caller", 0.95);
+    const callerPlays = plays.filter((p) => p.channel === "chan-caller");
+    expect(callerPlays.at(-2)!.code).toBe("en-IN");
+    expect(callerPlays.at(-2)!.text).toContain("Got it");
+    expect(callerPlays.at(-1)!.code).toBe("en-IN");
+  });
 });

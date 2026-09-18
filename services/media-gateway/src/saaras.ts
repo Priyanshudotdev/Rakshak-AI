@@ -10,7 +10,7 @@
 
 export interface RealtimeCallbacks {
   onPartial: (text: string, language?: string) => void;
-  onFinal: (text: string, language?: string) => void;
+  onFinal: (text: string, language?: string, confidence?: number) => void;
   onError: (err: Error) => void;
   onClose: () => void;
   /** Raw server event tap (diagnostics): fired for every parsed message. */
@@ -51,6 +51,12 @@ export interface SaarasRealtimeOptions {
   streamType?: "fast" | "balanced" | "simulated";
   /** 8000 (telephony) or 16000. Must match the PCM actually sent. */
   sampleRate?: 8000 | 16000;
+  /** VAD sensitivity 0.0-1.0. Sent only when set (server default rules). */
+  threshold?: number;
+  /** End-of-speech silence ms. Sent only when set. */
+  silenceDurationMs?: number;
+  /** Minimum speech ms per utterance. Sent only when set. */
+  minSpeechDurationMs?: number;
   /** Socket factory; default is the `ws` package. Injected in tests. */
   createSocket?: (url: string, opts: { headers: Record<string, string> }) => SocketLike;
 }
@@ -69,7 +75,8 @@ const REALTIME_URL = "wss://api.sarvam.ai/speech-to-text-realtime/ws";
  *  (NOT wav — strip the 44-byte header before sending). */
 export class SaarasRealtimeAdapter implements RealtimeAdapter {
   readonly kind = "saaras-realtime";
-  private readonly opts: Required<Omit<SaarasRealtimeOptions, "createSocket">> & Pick<SaarasRealtimeOptions, "createSocket">;
+  private readonly opts: Required<Omit<SaarasRealtimeOptions, "createSocket" | "threshold" | "silenceDurationMs" | "minSpeechDurationMs">> &
+    Pick<SaarasRealtimeOptions, "createSocket" | "threshold" | "silenceDurationMs" | "minSpeechDurationMs">;
 
   constructor(opts: SaarasRealtimeOptions = {}) {
     this.opts = {
@@ -77,6 +84,9 @@ export class SaarasRealtimeAdapter implements RealtimeAdapter {
       languageCode: opts.languageCode ?? "auto",
       streamType: opts.streamType ?? "fast",
       sampleRate: opts.sampleRate ?? 16000,
+      threshold: opts.threshold,
+      silenceDurationMs: opts.silenceDurationMs,
+      minSpeechDurationMs: opts.minSpeechDurationMs,
       createSocket: opts.createSocket,
     };
   }
@@ -91,6 +101,11 @@ export class SaarasRealtimeAdapter implements RealtimeAdapter {
       encoding: "linear16",
       sample_rate: String(this.opts.sampleRate),
     });
+    // VAD knobs are connection-only and optional: absent = server defaults.
+    // Set them (env GATEWAY_VAD_* on the voice box) only for noisy-line tuning.
+    if (this.opts.threshold !== undefined) params.set("threshold", String(this.opts.threshold));
+    if (this.opts.silenceDurationMs !== undefined) params.set("silence_duration_ms", String(this.opts.silenceDurationMs));
+    if (this.opts.minSpeechDurationMs !== undefined) params.set("min_speech_duration_ms", String(this.opts.minSpeechDurationMs));
     const url = `${this.opts.url}?${params}`;
     // Lazy import keeps unit tests (injected factory) free of the `ws` package.
     const { WebSocket } = await import("ws");
@@ -138,7 +153,7 @@ export class SaarasRealtimeAdapter implements RealtimeAdapter {
     });
 
     ws.on("message", (raw: unknown) => {
-      let msg: { event?: string; text?: string; language?: string; code?: string | number; is_fatal?: boolean; message?: string };
+      let msg: { event?: string; text?: string; language?: string; language_confidence?: number; code?: string | number; is_fatal?: boolean; message?: string };
       try {
         msg = JSON.parse(String(raw)) as typeof msg;
       } catch {
@@ -154,7 +169,7 @@ export class SaarasRealtimeAdapter implements RealtimeAdapter {
           if (msg.text) cb.onPartial(msg.text, msg.language);
           break;
         case "transcript.final":
-          if (msg.text) cb.onFinal(msg.text, msg.language);
+          if (msg.text) cb.onFinal(msg.text, msg.language, msg.language_confidence);
           break;
         case "error":
           cb.onError(new Error(`Saaras realtime ${msg.code ?? ""}: ${msg.message ?? "unknown error"}`.trim()));
@@ -177,11 +192,22 @@ export class SaarasRealtimeAdapter implements RealtimeAdapter {
   }
 }
 
+function numEnv(name: string): number | undefined {
+  const v = (process.env[name] ?? "").trim();
+  if (!v) return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
 export function createAdapter(): RealtimeAdapter {
   // REALTIME=saaras opens a live Saaras session per call leg (needs SARVAM_API_KEY
   // + 16k/8k linear16 PCM from Asterisk/mic). Anything else keeps replay/file mode.
   if ((process.env.REALTIME ?? "").toLowerCase() === "saaras") {
-    return new SaarasRealtimeAdapter();
+    return new SaarasRealtimeAdapter({
+      threshold: numEnv("GATEWAY_VAD_THRESHOLD"),
+      silenceDurationMs: numEnv("GATEWAY_VAD_SILENCE_MS"),
+      minSpeechDurationMs: numEnv("GATEWAY_VAD_MIN_SPEECH_MS"),
+    });
   }
   return new PassthroughAdapter();
 }
