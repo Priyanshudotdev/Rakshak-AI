@@ -99,10 +99,20 @@ export class SaarasRealtimeAdapter implements RealtimeAdapter {
       : (new WebSocket(url, { headers: { "api-subscription-key": key } }) as unknown as SocketLike);
 
     let closed = false;
+    let sendFailed = false;
     const session: RealtimeSession = {
       sendAudio(chunk: Uint8Array) {
         if (closed) return;
-        ws.send(JSON.stringify({ event: "audio_input", audio: Buffer.from(chunk).toString("base64") }));
+        try {
+          ws.send(JSON.stringify({ event: "audio_input", audio: Buffer.from(chunk).toString("base64") }));
+        } catch (err) {
+          // Tripwire: a dead-but-never-closed socket would otherwise drop
+          // every packet silently (callers of sendAudio swallow errors).
+          if (!sendFailed) {
+            sendFailed = true;
+            cb.onError(err instanceof Error ? err : new Error(`saaras send failed: ${String(err)}`));
+          }
+        }
       },
       close() {
         if (closed) return;
