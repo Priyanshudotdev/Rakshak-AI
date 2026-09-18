@@ -59,7 +59,7 @@ jobs:
               -o ConnectTimeout=15 \
               -o StrictHostKeyChecking=yes \
               "$VPS_USER@$VPS_HOST" \
-              'rm -rf /tmp/rakshak-deploy && mkdir -p /tmp/rakshak-deploy && tar xzf - -C /tmp'
+              'rm -rf /tmp/rakshak-deploy && mkdir -p /tmp/rakshak-deploy && tar xzf - -C /tmp/rakshak-deploy'
 
       - name: Provision + verify Asterisk
         uses: appleboy/ssh-action@v0.1.10
