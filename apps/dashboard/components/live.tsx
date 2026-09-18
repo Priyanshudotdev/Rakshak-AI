@@ -105,7 +105,7 @@ export function LivePanel({ feed }: { feed: LiveFeed }) {
         <WaitingRoomBanner events={events} />
         {lastPartial ? (
           <div className="mb-3 rounded-md2 border border-priomed/40 bg-priomed/10 p-2.5">
-            <p className="mb-1 text-[11px] font-medium uppercase tracking-wider text-[#f0c94e]">Hearing now (partial)</p>
+            <p className="mb-1 text-[11px] font-medium uppercase tracking-wider text-[#8a5a00]">Hearing now (partial)</p>
             <p className="text-sm text-cream">{lastPartial}</p>
           </div>
         ) : null}

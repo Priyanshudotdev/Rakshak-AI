@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   audioUrl,
@@ -58,21 +59,148 @@ const invalidateAll = (qc: ReturnType<typeof useQueryClient>) =>
     qc.invalidateQueries({ queryKey: ["dispatch"] }),
   ]);
 
-/* ---------------- Header ---------------- */
+/* ---------------- Navigation (sidebar + topbar) ---------------- */
 
-function Header({ count }: { count?: number }) {
-  const health = useQuery({ queryKey: ["health"], queryFn: getHealth, refetchInterval: 10_000 });
+type Section = "home" | "live" | "incidents" | "operators";
+
+const SECTION_META: Record<Section, { title: string; sub: string }> = {
+  home: { title: "Overview", sub: "At a glance · new incident intake" },
+  live: { title: "Live Calls", sub: "Streaming audio intelligence · translation" },
+  incidents: { title: "Incidents", sub: "Records · evidence · actions" },
+  operators: { title: "Operators", sub: "Profile · language · dispatch" },
+};
+
+function NavIcon({ d }: { d: string }) {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d={d} />
+    </svg>
+  );
+}
+
+const NAV: Array<{ group: string; items: Array<{ id: Section; label: string; hint: string; icon: string }> }> = [
+  {
+    group: "Monitor",
+    items: [
+      { id: "home", label: "Overview", hint: "Stats + intake", icon: "M3 10.5 12 3l9 7.5 M5 9.5V21h5v-6h4v6h5V9.5" },
+      { id: "live", label: "Live Calls", hint: "Stream + translate", icon: "M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 2 .7 2.8a2 2 0 0 1-.5 2.1L8.1 9.9a16 16 0 0 0 6 6l1.3-1.2a2 2 0 0 1 2.1-.5c.9.3 1.9.6 2.8.7a2 2 0 0 1 1.7 2Z" },
+    ],
+  },
+  {
+    group: "Work",
+    items: [
+      { id: "incidents", label: "Incidents", hint: "Records + workspace", icon: "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z" },
+    ],
+  },
+  {
+    group: "Team",
+    items: [
+      { id: "operators", label: "Operators", hint: "Profile · language · dispatch", icon: "M9 11a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z M2.5 20c.8-3.4 3.4-5 6.5-5s5.7 1.6 6.5 5 M16 4.6a3.5 3.5 0 0 1 0 6.8 M17.5 15.4c2 .6 3.5 2 4 4.6" },
+    ],
+  },
+];
+
+function SidebarNav({
+  section,
+  onSelect,
+  onNavigate,
+}: {
+  section: Section;
+  onSelect: (s: Section) => void;
+  onNavigate?: () => void;
+}) {
+  const [open, setOpen] = useState<Record<string, boolean>>({ Monitor: true, Work: true, Team: true });
+  const session = useSignedInOperator();
+  return (
+    <div className="flex h-full flex-col">
+      <div className="flex items-center gap-3 px-4 pb-4 pt-5">
+        <span className="flex h-9 w-9 items-center justify-center rounded-lg2 bg-accent font-mono text-lg font-bold text-white">
+          R
+        </span>
+        <div className="min-w-0">
+          <p className="truncate text-sm font-semibold leading-tight text-cream">Rakshak AI</p>
+          <p className="truncate text-[11px] text-muted">Operator Console</p>
+        </div>
+      </div>
+      <nav className="min-h-0 flex-1 space-y-4 overflow-y-auto px-3" aria-label="Console sections">
+        {NAV.map((g) => (
+          <div key={g.group}>
+            <button
+              type="button"
+              onClick={() => setOpen((o) => ({ ...o, [g.group]: !o[g.group] }))}
+              className="mb-1 flex w-full items-center justify-between px-2 text-[11px] font-semibold uppercase tracking-wider text-muted hover:text-cream"
+              aria-expanded={!!open[g.group]}
+            >
+              {g.group}
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className={`transition-transform ${open[g.group] ? "" : "-rotate-90"}`}>
+                <path d="m6 9 6 6 6-6" />
+              </svg>
+            </button>
+            {open[g.group] ? (
+              <ul className="space-y-0.5">
+                {g.items.map((item) => {
+                  const active = section === item.id;
+                  return (
+                    <li key={item.id}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onSelect(item.id);
+                          onNavigate?.();
+                        }}
+                        aria-current={active ? "page" : undefined}
+                        className={`flex w-full items-center gap-2.5 rounded-md2 px-2.5 py-2 text-left text-sm transition-colors ${
+                          active ? "bg-surface3 font-medium text-cream" : "text-muted hover:bg-surface2 hover:text-cream"
+                        }`}
+                      >
+                        <NavIcon d={item.icon} />
+                        <span className="min-w-0">
+                          <span className="block truncate leading-tight">{item.label}</span>
+                          <span className="block truncate text-[11px] font-normal opacity-80">{item.hint}</span>
+                        </span>
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : null}
+          </div>
+        ))}
+      </nav>
+      <div className="border-t border-line p-3">
+        <div className="flex items-center gap-2.5 rounded-md2 px-2 py-1.5">
+          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-surface3 text-xs font-semibold text-cream">
+            {(session?.name ?? "?").slice(0, 1).toUpperCase()}
+          </span>
+          <span className="min-w-0">
+            <span className="block truncate text-sm font-medium leading-tight text-cream">{session?.name ?? "Not signed in"}</span>
+            <span className="block truncate text-[11px] text-muted">{session ? `${session.role} · profile in Operators` : "Sign in under Operators"}</span>
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Topbar({ section, count, onMenu }: { section: Section; count?: number; onMenu: () => void }) {
+  const health = useQuery({ queryKey: ["health"], queryFn: getHealth, refetchInterval: 10_000, placeholderData: keepPreviousData });
+  const meta = SECTION_META[section];
   return (
     <header className="sticky top-0 z-10 border-b border-line bg-ink/95 backdrop-blur">
       <div className="mx-auto flex max-w-[1400px] flex-wrap items-center gap-3 px-4 py-3">
-        <div className="flex items-center gap-3">
-          <span className="flex h-9 w-9 items-center justify-center rounded-lg2 bg-accent font-mono text-lg font-bold text-white">
-            R
-          </span>
-          <div>
-            <h1 className="text-base font-semibold leading-tight text-white">Rakshak AI — Operator Console</h1>
-            <p className="text-xs text-muted">AI assists · Human operator decides · No autonomous dispatch</p>
-          </div>
+        <button
+          type="button"
+          onClick={onMenu}
+          className="rounded-md2 border border-line p-2 text-muted hover:text-cream lg:hidden"
+          aria-label="Open navigation"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+            <path d="M4 6h16M4 12h16M4 18h16" />
+          </svg>
+        </button>
+        <div className="min-w-0">
+          <h1 className="truncate text-base font-semibold leading-tight text-cream">{meta.title}</h1>
+          <p className="truncate text-xs text-muted">{meta.sub}</p>
         </div>
         <div className="ml-auto flex items-center gap-2">
           <Badge tone={health.data?.status === "ok" ? "ok" : "bad"}>
@@ -1098,6 +1226,8 @@ function DispatchPanel() {
 
 export function OpsConsole() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [section, setSection] = useState<Section>("home");
+  const [navOpen, setNavOpen] = useState(false);
   const feed = useLiveEvents();
   const count = useQuery({ queryKey: ["count"], queryFn: getRecordCount, refetchInterval: 8000, placeholderData: keepPreviousData });
   const records = useQuery({
@@ -1111,31 +1241,65 @@ export function OpsConsole() {
     : null;
 
   return (
-    <div className="min-h-dvh">
-      <Header count={count.data} />
-      <main className="mx-auto max-w-[1400px] space-y-4 px-4 py-4">
-        <AnalyticsStrip />
-        <div className="grid grid-cols-1 gap-4 xl:grid-cols-[340px_minmax(0,1fr)_minmax(0,1.2fr)]">
-          <div className="space-y-4">
-            <IntakePanel onDone={(id) => setSelectedId(id)} />
-            <LivePanel feed={feed} />
-            <LiveTranslationPanel feed={feed} />
-            <OperatorListen feed={feed} />
-            <OperatorProfile />
-            <DispatchPanel />
-          </div>
-          <RecordsPanel selectedId={selectedId} onSelect={(id) => setSelectedId(id)} />
-          <Card className="min-h-[420px]">
-            <CardHead title="Incident workspace" sub="Evidence · reasoning · actions" />
-            <CardBody>
-              <RecordDetail record={selected} events={feed.events} />
-            </CardBody>
-          </Card>
+    <div className="min-h-dvh lg:flex">
+      {/* Desktop sidebar */}
+      <aside className="sticky top-0 hidden h-dvh w-60 shrink-0 border-r border-line bg-surface lg:block">
+        <SidebarNav section={section} onSelect={setSection} />
+      </aside>
+      {/* Mobile drawer */}
+      {navOpen ? (
+        <div className="fixed inset-0 z-40 lg:hidden" role="dialog" aria-label="Console navigation">
+          <div className="absolute inset-0 bg-ink/60" onClick={() => setNavOpen(false)} aria-hidden="true" />
+          <aside className="absolute inset-y-0 left-0 w-72 max-w-[85vw] border-r border-line bg-surface shadow-xl">
+            <SidebarNav
+              section={section}
+              onSelect={setSection}
+              onNavigate={() => setNavOpen(false)}
+            />
+          </aside>
         </div>
-        <footer className="pb-6 pt-2 text-center text-xs text-muted">
-          Rakshak AI V2 · COMMUNICATE → UNDERSTAND → CORRELATE · Verification stays explicit: reported ≠ confirmed.
-        </footer>
-      </main>
+      ) : null}
+      <div className="min-w-0 flex-1">
+        <Topbar section={section} count={count.data} onMenu={() => setNavOpen(true)} />
+        <main className="mx-auto max-w-[1400px] space-y-4 px-4 py-4">
+          {section === "home" ? (
+            <>
+              <AnalyticsStrip />
+              <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+                <IntakePanel onDone={(id) => setSelectedId(id)} />
+                <LivePanel feed={feed} />
+              </div>
+            </>
+          ) : null}
+          {section === "live" ? (
+            <div className="mx-auto max-w-3xl space-y-4">
+              <LivePanel feed={feed} />
+              <LiveTranslationPanel feed={feed} />
+              <OperatorListen feed={feed} />
+            </div>
+          ) : null}
+          {section === "incidents" ? (
+            <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
+              <RecordsPanel selectedId={selectedId} onSelect={(id) => setSelectedId(id)} />
+              <Card className="min-h-[420px]">
+                <CardHead title="Incident workspace" sub="Evidence · reasoning · actions" />
+                <CardBody>
+                  <RecordDetail record={selected} events={feed.events} />
+                </CardBody>
+              </Card>
+            </div>
+          ) : null}
+          {section === "operators" ? (
+            <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+              <OperatorProfile />
+              <DispatchPanel />
+            </div>
+          ) : null}
+          <footer className="pb-6 pt-2 text-center text-xs text-muted">
+            Rakshak AI V2 · COMMUNICATE → UNDERSTAND → CORRELATE · Verification stays explicit: reported ≠ confirmed.
+          </footer>
+        </main>
+      </div>
     </div>
   );
 }

@@ -3,26 +3,23 @@
 @tailwind utilities;
 
 :root {
-  color-scheme: dark;
+  color-scheme: light;
 }
 
 html,
 body {
   min-height: 100dvh;
-  background: #12151a;
-  color: #e8e4dc;
+  background: #f4f4f1;
+  color: #1b1e22;
   font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
 }
 
 body {
-  background-image:
-    linear-gradient(rgba(196, 92, 38, 0.045) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(196, 92, 38, 0.045) 1px, transparent 1px);
-  background-size: 48px 48px;
+  background-image: none;
 }
 
 ::selection {
-  background: rgba(196, 92, 38, 0.45);
+  background: rgba(196, 92, 38, 0.25);
 }
 
 audio {
@@ -33,13 +30,13 @@ audio {
 /* Slim scrollbars for dense ops panels */
 * {
   scrollbar-width: thin;
-  scrollbar-color: #2a3240 transparent;
+  scrollbar-color: #cfcfc4 transparent;
 }
 *::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 *::-webkit-scrollbar-thumb {
-  background: #2a3240;
+  background: #cfcfc4;
   border-radius: 8px;
 }

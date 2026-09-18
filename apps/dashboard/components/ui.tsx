@@ -3,7 +3,7 @@ import type { PriorityLevel } from "../lib/types";
 
 export function Card({ children, className = "" }: { children: ReactNode; className?: string }) {
   return (
-    <section className={`rounded-lg2 border border-line bg-surface shadow-[0_1px_0_rgba(0,0,0,0.4)] ${className}`}>
+    <section className={`rounded-lg2 border border-line bg-surface shadow-[0_1px_2px_rgba(16,24,40,0.07)] ${className}`}>
       {children}
     </section>
   );
@@ -82,10 +82,10 @@ export function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>
 export function Badge({ children, tone = "neutral" }: { children: ReactNode; tone?: "neutral" | "info" | "ok" | "warn" | "bad" }) {
   const tones: Record<string, string> = {
     neutral: "border-line bg-surface2 text-cream",
-    info: "border-infoblue/50 bg-infoblue/10 text-[#93c5fd]",
-    ok: "border-priolow/50 bg-priolow/10 text-[#7fd6ae]",
-    warn: "border-priomed/50 bg-priomed/10 text-[#f0c94e]",
-    bad: "border-priohigh/60 bg-priohigh/10 text-[#f19393]",
+    info: "border-infoblue/40 bg-infoblue/10 text-[#1d4ed8]",
+    ok: "border-priolow/40 bg-priolow/10 text-[#046c4e]",
+    warn: "border-priomed/40 bg-priomed/10 text-[#8a5a00]",
+    bad: "border-priohigh/40 bg-priohigh/10 text-[#b42323]",
   };
   return (
     <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-[11px] ${tones[tone]}`}>
@@ -131,7 +131,7 @@ export function Spinner() {
 export function Alert({ kind, children }: { kind: "error" | "ok"; children: ReactNode }) {
   const cls =
     kind === "error"
-      ? "border-priohigh/60 bg-priohigh/10 text-[#f3b0b0]"
-      : "border-priolow/50 bg-priolow/10 text-[#9fe3c3]";
+      ? "border-priohigh/50 bg-priohigh/10 text-[#a11f1f]"
+      : "border-priolow/50 bg-priolow/10 text-[#05603f]";
   return <div className={`rounded-md2 border px-3 py-2 text-sm ${cls}`}>{children}</div>;
 }
