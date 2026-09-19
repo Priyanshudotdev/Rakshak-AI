@@ -26,6 +26,7 @@ import {
   WifiSlash,
 } from "@phosphor-icons/react";
 import { Shell, useAvailability, type ShellAlert } from "@/components/shell";
+import { useMounted } from "@/lib/mounted";
 import { Alert, Badge, Card, CardHead, EmptyState, Select, Skeleton, Stat } from "@/components/ui";
 import { deriveCalls, useLiveEvents, type LiveEvent } from "@/lib/live";
 import { getHealth, getSession, listRecords } from "@/lib/api";
@@ -114,6 +115,9 @@ type MicPermission = "granted" | "denied" | "prompt" | "unknown";
 
 export default function HomePage() {
   const feed = useLiveEvents();
+  // Relative times depend on the client clock: render placeholders until
+  // hydration completes so server and client HTML agree exactly.
+  const mounted = useMounted();
   const { calls, waitingOperators } = React.useMemo(() => deriveCalls(feed.events), [feed.events]);
   const { availability, setAvailability } = useAvailability();
 
@@ -315,7 +319,7 @@ export default function HomePage() {
                       <p className="truncate text-xs text-muted">{detail}</p>
                     </div>
                     <time dateTime={e.at} title={e.at} className="shrink-0 text-xs tabular-nums text-faint">
-                      {timeAgo(e.at)}
+                      {mounted ? timeAgo(e.at) : "—"}
                     </time>
                   </li>
                 );
@@ -456,7 +460,7 @@ export default function HomePage() {
                   </p>
                   <p className="truncate text-xs tabular-nums text-muted">
                     {r.id}
-                    {r.created_at ? ` · ${timeAgo(r.created_at)}` : ""}
+                    {r.created_at ? ` · ${mounted ? timeAgo(r.created_at) : "—"}` : ""}
                   </p>
                 </div>
                 {r.priority?.level ? (

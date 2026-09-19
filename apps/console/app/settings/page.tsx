@@ -373,8 +373,17 @@ export default function SettingsPage() {
 
   /* notifications */
   const [notifMsg, setNotifMsg] = useState<string | null>(null);
-  const desktopPermission =
-    typeof Notification !== "undefined" ? Notification.permission : "unsupported";
+  // Permission is read client-side only: reading Notification.permission during
+  // render produces different HTML on server ("unsupported") vs client and
+  // crashes hydration. Initial value matches the server render exactly.
+  const [desktopPermission, setDesktopPermission] = useState("unsupported");
+  useEffect(() => {
+    try {
+      if (typeof Notification !== "undefined") setDesktopPermission(Notification.permission);
+    } catch {
+      /* keep fallback */
+    }
+  }, []);
 
   function playBeep() {
     try {

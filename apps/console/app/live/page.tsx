@@ -128,14 +128,16 @@ function formatDuration(totalSeconds: number): string {
   return `${h > 0 ? `${h}:` : ""}${mm}:${String(sec).padStart(2, "0")}`;
 }
 
-/** Seconds since startedAt; frozen at ended (lastAt - startedAt). */
-function elapsedSeconds(call: LiveCall, nowMs: number): number {
+/** Seconds since startedAt; frozen at ended (lastAt - startedAt). Null clock
+ *  (pre-hydration) renders as zero so server and client agree exactly. */
+function elapsedSeconds(call: LiveCall, nowMs: number | null): number {
   const start = new Date(call.startedAt).getTime();
   if (!Number.isFinite(start)) return 0;
   if (call.status === "ended") {
     const end = new Date(call.lastAt).getTime();
     return Number.isFinite(end) ? Math.max(0, (end - start) / 1000) : 0;
   }
+  if (nowMs === null) return 0;
   return Math.max(0, (nowMs - start) / 1000);
 }
 
@@ -245,7 +247,7 @@ function CallCard({
   onAssignCancel,
 }: {
   call: LiveCall;
-  nowMs: number;
+  nowMs: number | null;
   claim: Claim | undefined;
   me: string;
   busy: boolean;
@@ -312,7 +314,7 @@ function CallCard({
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <ClaimBadge claim={claim} me={me} />
             <span className="text-xs text-faint">
-              Started {formatTime(call.startedAt)}
+              {nowMs === null ? "Started —" : `Started ${formatTime(call.startedAt)}`}
               {call.incidentType ? ` · ${call.incidentType}` : ""}
               {call.utterances > 0 ? ` · ${call.utterances} utterance${call.utterances === 1 ? "" : "s"}` : ""}
             </span>
@@ -436,7 +438,10 @@ function LiveQueue() {
   const searchParams = useSearchParams();
   const { status, events, retryCount, nextRetryMs } = useLiveEvents();
 
-  const [nowMs, setNowMs] = useState(() => Date.now());
+  // nowMs starts null so server and first client render agree ("—");
+  // the interval sets real time client-side only. Rendering Date.now()
+  // directly would hydrate-mismatch on every load.
+  const [nowMs, setNowMs] = useState<number | null>(null);
   const [me, setMe] = useState("operator");
   const [claims, setClaims] = useState<Record<string, Claim>>({});
   const [busyCallId, setBusyCallId] = useState<string | null>(null);
@@ -446,6 +451,7 @@ function LiveQueue() {
   const [assignName, setAssignName] = useState("");
 
   useEffect(() => {
+    setNowMs(Date.now());
     const t = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
