@@ -31,4 +31,20 @@ describe("fallbackExtract", () => {
     const e = fallbackExtract("kal raat chori hui thi, report दर्ज karni hai", "");
     expect(e.immediate_danger.is_immediate_danger).toBe(false);
   });
+
+  it("detects romanized Marathi fire report", () => {
+    const e = fallbackExtract("Aag lagli aahe, ek kamgar adakla aahe", "");
+    expect(e.incident_type.primary).toBe("Fire");
+  });
+
+  it("does not match romanized keywords inside other words", () => {
+    expect(fallbackExtract("mi saag bhaji banvat aahe", "").incident_type.primary).toBe("Unknown");
+    expect(fallbackExtract("garden madhe mothi baag aahe", "").incident_type.primary).toBe("Unknown");
+    expect(fallbackExtract("drop the anchor and check the chord", "").incident_type.primary).toBe("Unknown");
+  });
+
+  it("detects romanized injury and hospital mentions", () => {
+    expect(fallbackExtract("to jakhmi zala aahe", "").incident_type.primary).toBe("Traffic Accident");
+    expect(fallbackExtract("tyala davakhanyat nyave lagel", "").incident_type.primary).toBe("Medical Emergency");
+  });
 });

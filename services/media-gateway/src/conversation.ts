@@ -140,7 +140,10 @@ export function createConversation(deps: ConversationDeps) {
     nudged.delete(callId);
   }
 
-  /** Translation toggle for a call (2s TTL cache, default false on error). */
+  /** Drop one call's cached toggle (event-driven invalidation; TTL is backstop). */
+  function invalidateToggle(callId: string): void {
+    if (callId) toggleCache.delete(callId);
+  }
   async function isTranslationEnabled(callId: string): Promise<boolean> {
     const now = Date.now();
     const cached = toggleCache.get(callId);
@@ -211,7 +214,21 @@ export function createConversation(deps: ConversationDeps) {
       const callerLang = (peer && langByCall.get(peer.callId)) || "Marathi";
       const callerChannel = peer ? ari.channelForCall(peer.callId) : null;
       if (!callerChannel) return;
-      await translateAndSpeak(callerChannel, text, replyVoice(callerLang).code, effLang);
+      // Gated rendition: operator speech renders into the caller channel ONLY
+      // when translation is ON for the caller call AND the caller tongue is
+      // unknown to the operator. Otherwise the caller hears the operator's
+      // original conference audio and the engine stays out of it.
+      if (peer) {
+        const prof = resolveProfile(peer.callId, callId);
+        const tongue = langByCall.get(peer.callId);
+        const render =
+          !!prof?.operator_id &&
+          !isKnownTongue(tongue, prof.known_languages ?? []) &&
+          (await isTranslationEnabled(peer.callId));
+        if (render) {
+          await translateAndSpeak(callerChannel, text, replyVoice(callerLang).code, effLang);
+        }
+      }
       // Conferencing enforcement for the caller call (desired = !toggle,
       // OR known-tongue => conference). After the rendition so in-flight
       // utterances finish under the old state; warn-never-break.
@@ -236,22 +253,26 @@ export function createConversation(deps: ConversationDeps) {
         };
         await speak(channelId, voice.confirm(body.data?.extraction?.incident_type), voice.code);
       }
-      // Same bridge, other ear: operator hears the caller translated.
-      // Rendition policy (single rendition, never stacked): profile + known
-      // tongue -> direct talk, silence; profile + unknown + toggle ON is
-      // rendered by the toggle block below; otherwise legacy rendition.
+      // Same bridge, other ear: operator hears the caller translated — ONLY
+      // when translation is ON and the tongue is unknown. In every other case
+      // (OFF, known tongue, no profile) the operator hears the original
+      // conference audio and nothing is rendered. Nudge once on mismatch.
       const peer = ari.bridgePeer(callId);
       if (peer && peer.role === "operator") {
-        const opChannel = ari.channelForCall(peer.callId);
         const prof = resolveProfile(callId, peer.callId);
         const tongue0 = effLang ?? prior ?? "Marathi";
         const toggleOn = prof?.operator_id ? await isTranslationEnabled(callId) : false;
-        if (!opChannel) {
-          /* nowhere to render */
-        } else if (prof?.operator_id && isKnownTongue(tongue0, prof.known_languages ?? [])) {
-          // Direct talk — engine stays out of the audio.
-        } else if (!(prof?.operator_id && toggleOn)) {
-          await translateAndSpeak(opChannel, text, deps.operatorLang, effLang);
+        if (prof?.operator_id && !isKnownTongue(tongue0, prof.known_languages ?? []) && !toggleOn && !nudged.has(callId)) {
+          nudged.add(callId);
+          try {
+            deps.publish?.("translation.suggested", callId, {
+              call_id: callId,
+              caller_language: tongue0,
+              operator_id: prof.operator_id,
+            });
+          } catch {
+            /* publish must never break the loop */
+          }
         }
       }
     } catch (err) {
@@ -357,6 +378,7 @@ export function createConversation(deps: ConversationDeps) {
     getOperatorProfile,
     clearCallState,
     isTranslationEnabled,
+    invalidateToggle,
     enforceConference,
     toggleCache,
     profileByCall,

@@ -42,3 +42,7 @@ dist/
 .next/
 *.tsbuildinfo
 npm-debug.log*
+
+# Autonomous loop (opencode infinite mode)
+logs/autonomous/
+AUTONOMOUS.STOP

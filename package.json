@@ -14,7 +14,9 @@
     "build": "npm run build --workspaces --if-present",
     "dev:api": "npm run dev --workspace apps/api",
     "dev:gateway": "npm run dev --workspace services/media-gateway",
-    "open": "opencode -s ses_f567fed93ffeUmx0yds8Wt0GjE"
+    "open": "opencode -s ses_f567fed93ffeUmx0yds8Wt0GjE",
+    "loop": "powershell -ExecutionPolicy Bypass -File scripts/autonomous-loop.ps1",
+    "loop:once": "opencode run -s ses_f567fed93ffeUmx0yds8Wt0GjE --auto"
   },
   "engines": {
     "node": ">=20"

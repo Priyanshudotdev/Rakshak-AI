@@ -61,7 +61,7 @@ describe("replyVoice", () => {
 });
 
 describe("two-way translated conversation", () => {
-  it("caller Marathi final: incident + Marathi replies + English for operator", async () => {
+  it("caller Marathi final without operator profile: incident + Marathi replies, operator hears nothing", async () => {
     const { conv, plays, fetchCalls } = setup();
     await conv.handleFinal("CALLER", "aag lagli aahe", "Marathi", "caller");
     expect(fetchCalls.some((c) => c.url.includes("/api/process-call"))).toBe(true);
@@ -69,24 +69,19 @@ describe("two-way translated conversation", () => {
     expect(callerPlays.map((p) => p.code)).toEqual(["mr-IN", "mr-IN"]);
     expect(callerPlays[0].text).toContain("माहिती मिळाली");
     expect(callerPlays[1].text).toContain("Fire");
-    const opPlays = plays.filter((p) => p.channel === "chan-op");
-    expect(opPlays).toHaveLength(1);
-    expect(opPlays[0].code).toBe("en-IN");
-    expect(opPlays[0].text).toContain("[[en-IN]]");
-    const tr = fetchCalls.find((c) => c.url.includes("/api/translate"));
-    expect(tr?.body).toMatchObject({ target_language_code: "en-IN" });
+    // No profile, no toggle: pure conference audio, zero renditions.
+    expect(plays.filter((p) => p.channel === "chan-op")).toHaveLength(0);
+    expect(fetchCalls.some((c) => c.url.includes("/api/translate"))).toBe(false);
   });
 
-  it("operator English final: Marathi to caller only, no incident", async () => {
+  it("operator English final without profile: stays silent, no incident", async () => {
     const { conv, plays, fetchCalls } = setup();
     await conv.handleFinal("CALLER", "aag lagli", "Marathi", "caller");
     const before = fetchCalls.length;
+    const playsBefore = plays.length;
     await conv.handleFinal("OP", "help is coming", "en-IN", "operator");
     expect(fetchCalls.slice(before).some((c) => c.url.includes("/api/process-call"))).toBe(false);
-    const callerPlays = plays.filter((p) => p.channel === "chan-caller");
-    const last = callerPlays.at(-1)!;
-    expect(last.code).toBe("mr-IN");
-    expect(last.text).toContain("[[mr-IN]]help is coming");
+    expect(plays).toHaveLength(playsBefore);
   });
 
   it("operator final with no live peer stays silent", async () => {
@@ -274,6 +269,34 @@ describe("translation toggle rendition", () => {
     conv.setOperatorProfile("CALLER", PROFILE);
     await conv.handleFinal("CALLER", "aag lagli", "Marathi", "caller");
     expect(published.filter((p) => p.name === "translation.suggested")).toHaveLength(1);
+  });
+
+  it("operator final renders into caller tongue only when toggle ON and unknown", async () => {
+    const { conv, plays } = setupToggle({ enabled: true });
+    await conv.handleFinal("CALLER", "aag lagli", "Marathi", "caller");
+    const before = plays.length;
+    await conv.handleFinal("OP", "help is coming", "en-IN", "operator");
+    const news = plays.slice(before).filter((p) => p.channel === "chan-caller");
+    expect(news).toHaveLength(1);
+    expect(news[0].code).toBe("mr-IN");
+  });
+
+  it("operator final stays silent when toggle OFF", async () => {
+    const { conv, plays } = setupToggle({ enabled: false });
+    await conv.handleFinal("CALLER", "aag lagli", "Marathi", "caller");
+    const before = plays.length;
+    await conv.handleFinal("OP", "help is coming", "en-IN", "operator");
+    expect(plays).toHaveLength(before);
+  });
+
+  it("invalidateToggle forces a fresh toggle read", async () => {
+    const { conv, fetchCalls } = setupToggle({ enabled: false });
+    await conv.handleFinal("CALLER", "aag lagli", "Marathi", "caller");
+    const n1 = fetchCalls.filter((c) => c.url.includes("/translation")).length;
+    expect(n1).toBeGreaterThan(0);
+    conv.invalidateToggle("CALLER");
+    await conv.isTranslationEnabled("CALLER");
+    expect(fetchCalls.filter((c) => c.url.includes("/translation")).length).toBe(n1 + 1);
   });
 
   it("teardown clears per-call caches", async () => {

@@ -3,6 +3,17 @@ export function fallbackExtract(originalText: string, englishText: string): Reco
   const blob = `${originalText || ""}\n${englishText || ""}`.toLowerCase();
   const english = (englishText || originalText || "").toLowerCase();
 
+  // Word-boundary matcher for ROMANIZED tokens: plain includes() would match
+  // "aag" inside "baggage"/"language". Devanagari tokens keep includes()
+  // (no case/word-boundary pitfalls in that script for our lists).
+  function wordHit(tokens: string[]): boolean {
+    return tokens.some((t) => {
+      if (/[^\x00-\x7F]/.test(t)) return blob.includes(t);
+      const esc = t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`(?<!\\p{L})${esc}(?!\\p{L})`, "u").test(blob);
+    });
+  }
+
   const areas: Array<[string, string]> = [
     ["manish nagar", "Manish Nagar"], ["मानीश नगर", "Manish Nagar"],
     ["raj nagar", "Raj Nagar"], ["राज नगर", "Raj Nagar"],
@@ -21,10 +32,10 @@ export function fallbackExtract(originalText: string, englishText: string): Reco
   else if (["रॉड", "rod"].some((t) => blob.includes(t))) weaponType = "rod";
 
   let primary = "Unknown", secondary = "";
-  if (["fire", "smoke", "आग", "धुआं"].some((t) => blob.includes(t))) { primary = "Fire"; secondary = "Building fire"; }
-  else if (["accident", "दुर्घटना", "injured", "जख्मी"].some((t) => blob.includes(t))) { primary = "Traffic Accident"; secondary = "Multiple injured"; }
-  else if (["chest", "ambulance", "एम्बुलन्स", "एम्बुलेंस", "breath", "छाती"].some((t) => blob.includes(t))) { primary = "Medical Emergency"; secondary = "Chest pain / breathing"; }
-  else if (["theft", "चोरी", "robbery", "कैश", "dukan", "दुकान"].some((t) => blob.includes(t))) {
+  if (["fire", "smoke", "आग", "धुआं"].some((t) => blob.includes(t)) || wordHit(["aag", "jalat"])) { primary = "Fire"; secondary = "Building fire"; }
+  else if (["accident", "दुर्घटना", "injured", "जख्मी"].some((t) => blob.includes(t)) || wordHit(["jakhmi", "zakhm", "apghat"])) { primary = "Traffic Accident"; secondary = "Multiple injured"; }
+  else if (["chest", "ambulance", "hospital", "एम्बुलन्स", "एम्बुलेंस", "breath", "छाती"].some((t) => blob.includes(t)) || wordHit(["davakhana", "davakhanyat", "davakhanyala", "rugna", "rugnalay"])) { primary = "Medical Emergency"; secondary = "Chest pain / breathing"; }
+  else if (["theft", "चोरी", "robbery", "कैश", "dukan", "दुकान"].some((t) => blob.includes(t)) || wordHit(["chori", "chor"])) {
     primary = "Theft";
     secondary = ["अभी", "now", "यहीं"].some((t) => blob.includes(t)) ? "In progress" : "Past incident";
   } else if (["husband", "पती", "domestic", "मारायला", "मार"].some((t) => blob.includes(t))) {

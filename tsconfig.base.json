@@ -13,7 +13,7 @@
     "resolveJsonModule": true,
     "isolatedModules": true
   },
-  // The Next.js dashboard has its own tsconfig (bundler resolution + JSX);
-  // its check is `npm run typecheck --workspace apps/dashboard`.
-  "exclude": ["apps/dashboard", "**/node_modules", "**/dist", "**/.next"]
+  // The Next.js apps have their own tsconfigs (bundler resolution + JSX);
+  // their checks are `npm run typecheck --workspace apps/dashboard|console`.
+  "exclude": ["apps/dashboard", "apps/console", "**/node_modules", "**/dist", "**/.next"]
 }

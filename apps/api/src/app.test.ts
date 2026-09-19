@@ -524,8 +524,11 @@ describe("migrations (006 + idempotency)", () => {
     const sql = FILES.map((f) =>
       readFileSync(fileURLToPath(new URL(`../../../database/migrations/${f}`, import.meta.url)), "utf-8"),
     ).join("\n");
-    await applyAll(db.public, sql);
-    await applyAll(db.public, sql);
+    const mem = { query: async (s: string) => {
+      await db.public.query(s);
+    } };
+    await applyAll(mem, sql);
+    await applyAll(mem, sql);
     const { Pool } = db.adapters.createPg();
     const pool = new Pool() as unknown as PoolLike;
     // pg-mem has no pg_tables — prove each table exists with a live SELECT.
@@ -541,7 +544,9 @@ describe("migrations (006 + idempotency)", () => {
     const sql = FILES.map((f) =>
       readFileSync(fileURLToPath(new URL(`../../../database/migrations/${f}`, import.meta.url)), "utf-8"),
     ).join("\n");
-    await applyAll(db.public, sql);
+    await applyAll({ query: async (s: string) => {
+      await db.public.query(s);
+    } }, sql);
     const { Pool } = db.adapters.createPg();
     injectPool(new Pool() as unknown as PoolLike);
     resetSchemaForTests();

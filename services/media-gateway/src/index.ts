@@ -306,6 +306,44 @@ if (adapter.kind === "saaras-realtime") {
   ari.start().catch((err) => log("warn", "ari controller failed", { err: String(err) }));
 }
 
+// Toggle-event subscriber: translation.toggled clears that call's cached
+// toggle immediately, so mid-call flips apply on the next utterance instead
+// of waiting out the 2s TTL. Best-effort loop (warn-only); TTL is backstop.
+void (async function subscribeToggleEvents() {
+  for (;;) {
+    try {
+      const { WebSocket } = await import("ws");
+      const ws = new WebSocket(API_URL.replace(/^http/, "ws") + "/api/stream");
+      await new Promise<void>((resolve, reject) => {
+        ws.on("open", () => resolve());
+        ws.on("error", (err: unknown) => reject(err instanceof Error ? err : new Error(String(err))));
+      });
+      log("info", "toggle subscriber connected");
+      await new Promise<void>((resolve) => {
+        ws.on("message", (raw: unknown) => {
+          try {
+            const msg = JSON.parse(String(raw)) as { name?: string; callId?: string; payload?: { call_id?: string } };
+            if (msg?.name === "translation.toggled") {
+              const id = msg.callId || msg.payload?.call_id || "";
+              if (id) {
+                conversation.invalidateToggle(id);
+                log("info", "toggle cache invalidated", { callId: id });
+              }
+            }
+          } catch {
+            /* ignore malformed frames */
+          }
+        });
+        ws.on("close", () => resolve());
+        ws.on("error", () => resolve());
+      });
+    } catch (err) {
+      log("warn", "toggle subscriber failed, retrying", { err: String(err) });
+    }
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+})();
+
 http.listen(PORT, () => {
   log("info", `media-gateway listening on :${PORT}`, { mode: adapter.kind, api: API_URL });
 });
