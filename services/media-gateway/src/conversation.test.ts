@@ -330,3 +330,155 @@ describe("translation toggle rendition", () => {
     expect(conv.getOperatorProfile("CALLER")).toMatchObject({ operator_id: "OP-1" });
   });
 });
+
+describe("toggle-driven conferencing enforcement (direct conference vs separated)", () => {
+  const PROFILE = { operator_id: "OP-1", default_language: "hi-IN", known_languages: ["en", "hi"] };
+
+  function setupConf(opts: { enabled?: boolean | ((url: string) => boolean); failConference?: boolean } = {}) {
+    const plays: Array<{ channel: string; text: string; code: string }> = [];
+    const fetchCalls: Array<{ url: string; body: unknown }> = [];
+    const published: Array<{ name: string; callId: string; payload: unknown }> = [];
+    const logs: Array<{ level: string; msg: string }> = [];
+    const conferenceCalls: Array<{ callerCallId: string; conferenced: boolean }> = [];
+    const channels = new Map([
+      ["CALLER", "chan-caller"],
+      ["OP", "chan-op"],
+    ]);
+    const peers = new Map([
+      ["CALLER", { callId: "OP", channelId: "chan-op", role: "operator" }],
+      ["OP", { callId: "CALLER", channelId: "chan-caller", role: "caller" }],
+    ]);
+    const ari = {
+      channelForCall: (id: string) => channels.get(id) ?? null,
+      bridgePeer: (id: string) => peers.get(id) ?? null,
+      playReply: async (channel: string, text: string, code = "mr-IN") => {
+        plays.push({ channel, text, code });
+      },
+      setOperatorConferenced: vi.fn(async (callerCallId: string, conferenced: boolean) => {
+        conferenceCalls.push({ callerCallId, conferenced });
+        if (opts.failConference) throw new Error("asterisk down");
+      }),
+    };
+    let toggleFlag: boolean | ((url: string) => boolean) = opts.enabled ?? false;
+    const fetchFn = vi.fn(async (url: string, init: { body?: string }) => {
+      const body = init.body ? (JSON.parse(init.body) as Record<string, unknown>) : {};
+      fetchCalls.push({ url: String(url), body });
+      if (String(url).includes("/api/translate")) {
+        return { ok: true, json: async () => ({ data: { translated_text: `[[${body.target_language_code}]]${body.text}` } }) };
+      }
+      if (String(url).includes("/api/process-call")) {
+        return {
+          ok: true,
+          json: async () => ({ data: { extraction: { incident_type: "Fire" }, priority: { level: "HIGH" } } }),
+        };
+      }
+      if (String(url).match(/\/api\/calls\/.+\/translation/)) {
+        const flag = typeof toggleFlag === "function" ? toggleFlag(String(url)) : toggleFlag;
+        const callId = String(url).split("/api/calls/")[1]?.split("/translation")[0];
+        return { ok: true, json: async () => ({ call_id: decodeURIComponent(callId ?? ""), enabled: flag }) };
+      }
+      return { ok: false, json: async () => ({}) };
+    });
+    const conv = createConversation({
+      ari: () => ari as never,
+      apiUrl: "http://api:3001",
+      fetchFn: fetchFn as unknown as typeof fetch,
+      log: (level, msg) => void logs.push({ level, msg }),
+      operatorLang: "en-IN",
+      publish: (name, callId, payload) => void published.push({ name, callId, payload }),
+    });
+    return {
+      conv,
+      ari,
+      plays,
+      fetchCalls,
+      published,
+      logs,
+      conferenceCalls,
+      setToggle: (v: boolean | ((url: string) => boolean)) => {
+        toggleFlag = v;
+        conv.toggleCache.delete("CALLER");
+        conv.toggleCache.delete("OP");
+      },
+    };
+  }
+
+  it("join-with-toggle-OFF adds operator to caller bridge (direct conference)", async () => {
+    const { conv, conferenceCalls } = setupConf({ enabled: false });
+    conv.setOperatorProfile("CALLER", PROFILE);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(conferenceCalls).toContainEqual({ callerCallId: "CALLER", conferenced: true });
+  });
+
+  it("caller final with toggle OFF enforces conference; toggle ON removes; OFF-again re-adds", async () => {
+    const ctx = setupConf({ enabled: false });
+    ctx.conv.setOperatorProfile("CALLER", PROFILE);
+    await new Promise((r) => setTimeout(r, 20));
+    ctx.conferenceCalls.length = 0;
+    ctx.conv.toggleCache.delete("CALLER");
+    // Toggle OFF + unknown Marathi tongue => DIRECT CONFERENCE.
+    await ctx.conv.handleFinal("CALLER", "aag lagli aahe", "Marathi", "caller");
+    expect(ctx.conferenceCalls.at(-1)).toEqual({ callerCallId: "CALLER", conferenced: true });
+    // Toggle ON + unknown => SEPARATED (remove from bridge).
+    ctx.setToggle(true);
+    await ctx.conv.handleFinal("CALLER", "aag lagli aahe", "Marathi", "caller");
+    expect(ctx.conferenceCalls.at(-1)).toEqual({ callerCallId: "CALLER", conferenced: false });
+    // OFF-again => re-add.
+    ctx.setToggle(false);
+    await ctx.conv.handleFinal("CALLER", "aag lagli aahe", "Marathi", "caller");
+    expect(ctx.conferenceCalls.at(-1)).toEqual({ callerCallId: "CALLER", conferenced: true });
+  });
+
+  it("known tongue conferences even when toggle ON (direct talk)", async () => {
+    const ctx = setupConf({ enabled: true });
+    ctx.conv.setOperatorProfile("CALLER", PROFILE);
+    await new Promise((r) => setTimeout(r, 20));
+    ctx.conferenceCalls.length = 0;
+    ctx.conv.toggleCache.delete("CALLER");
+    // Hindi is known to OP-1 (en,hi) => conference despite toggle ON.
+    await ctx.conv.handleFinal("CALLER", "madad chahiye", "Hindi", "caller");
+    expect(ctx.conferenceCalls.at(-1)).toEqual({ callerCallId: "CALLER", conferenced: true });
+  });
+
+  it("idempotent: repeated finals with same toggle re-enforce without breaking renditions", async () => {
+    const ctx = setupConf({ enabled: true });
+    ctx.conv.setOperatorProfile("CALLER", PROFILE);
+    await new Promise((r) => setTimeout(r, 20));
+    ctx.conferenceCalls.length = 0;
+    ctx.conv.toggleCache.delete("CALLER");
+    await ctx.conv.handleFinal("CALLER", "aag lagli", "Marathi", "caller");
+    await ctx.conv.handleFinal("CALLER", "aag lagli", "Marathi", "caller");
+    // Conversation enforces on every final (ARI dedupes redundant REST).
+    expect(ctx.conferenceCalls).toHaveLength(2);
+    expect(ctx.conferenceCalls[0]).toEqual({ callerCallId: "CALLER", conferenced: false });
+    expect(ctx.conferenceCalls[1]).toEqual({ callerCallId: "CALLER", conferenced: false });
+    // Rendition still happened once per final (translation-only path intact).
+    const opHi = ctx.plays.filter((p) => p.channel === "chan-op" && p.code === "hi-IN");
+    expect(opHi.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("operator final enforces conferencing for the caller call", async () => {
+    const ctx = setupConf({ enabled: false });
+    ctx.conv.setOperatorProfile("CALLER", PROFILE);
+    await new Promise((r) => setTimeout(r, 20));
+    ctx.conferenceCalls.length = 0;
+    ctx.conv.toggleCache.delete("CALLER");
+    await ctx.conv.handleFinal("CALLER", "aag lagli", "Marathi", "caller");
+    ctx.conferenceCalls.length = 0;
+    ctx.conv.toggleCache.delete("CALLER");
+    await ctx.conv.handleFinal("OP", "help is coming", "en-IN", "operator");
+    expect(ctx.conferenceCalls.at(-1)).toEqual({ callerCallId: "CALLER", conferenced: true });
+  });
+
+  it("failed add/remove warns without breaking the call loop", async () => {
+    const ctx = setupConf({ enabled: false, failConference: true });
+    ctx.conv.setOperatorProfile("CALLER", PROFILE);
+    await new Promise((r) => setTimeout(r, 20));
+    // Join enforcement failed but must not throw; call loop continues.
+    await expect(ctx.conv.handleFinal("CALLER", "aag lagli", "Marathi", "caller")).resolves.toBeUndefined();
+    expect(ctx.conferenceCalls.at(-1)).toEqual({ callerCallId: "CALLER", conferenced: true });
+    expect(ctx.logs.some((l) => l.level === "warn" && l.msg.includes("conference"))).toBe(true);
+    // Emergency replies still played despite the conference failure.
+    expect(ctx.plays.filter((p) => p.channel === "chan-caller").length).toBeGreaterThanOrEqual(2);
+  });
+});

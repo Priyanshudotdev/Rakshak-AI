@@ -1,5 +1,6 @@
 "use client";
 
+import { CircleNotch, Pause, Play, Translate } from "@phosphor-icons/react";
 import { SUPPORTED_LANGUAGES } from "@/lib/types";
 import type { AudioDevice } from "@/lib/prefs";
 import { canSelectSink } from "./playback";
@@ -15,7 +16,8 @@ interface ControlBarProps {
   callerLang: string;
   onCallerLangChange: (v: string) => void;
   // Translation toggle.
-  translationOn: boolean;
+  // null = unknown / not yet loaded (backend default is OFF — never assume ON).
+  translationOn: boolean | null;
   translationLoading: boolean;
   onToggleTranslation: () => void;
   // Playback audio (utterance playback only — never the live call).
@@ -60,6 +62,11 @@ export function ControlBar(props: ControlBarProps): React.ReactElement {
     onEndMonitoring,
   } = props;
 
+  const translationUnknown = translationOn === null;
+  const translationActive = translationOn === true;
+  // Neutral until the GET resolves: disabled, never claims ON.
+  const translationBusy = translationLoading || translationUnknown;
+
   return (
     <div className="sticky bottom-0 z-30 -mx-4 mt-4 border-t border-line bg-card/95 px-4 py-3 shadow-card backdrop-blur">
       {/* Translation direction indicator */}
@@ -69,7 +76,11 @@ export function ControlBar(props: ControlBarProps): React.ReactElement {
         <span className="mx-2 text-faint">•</span>
         Operator speech: <span className="font-semibold text-ink">{operatorTongue}</span> →{" "}
         <span className="font-semibold text-ink">{callerTongue}</span> (caller tongue)
-        {!translationOn && <span className="ml-2 font-semibold text-warn">— translation paused</span>}
+        {translationBusy ? (
+          <span className="ml-2 font-semibold text-muted">— loading translation state…</span>
+        ) : !translationActive ? (
+          <span className="ml-2 font-semibold text-warn">— translation paused</span>
+        ) : null}
       </p>
 
       <div className="mx-auto mt-2 grid max-w-6xl grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -151,21 +162,63 @@ export function ControlBar(props: ControlBarProps): React.ReactElement {
           )}
         </fieldset>
 
-        {/* Translation toggle */}
-        <fieldset className="rounded-lg border border-line p-2.5">
-          <legend className="px-1 text-xs font-semibold text-muted">Translation</legend>
+        {/* Translation toggle — DOMINANT bottom-bar control */}
+        <fieldset className="rounded-lg border-2 border-primary/40 bg-primary-soft/30 p-2.5">
+          <legend className="px-1 text-xs font-bold text-primary-dark">Translation — call audio mode</legend>
           <button
             type="button"
             onClick={onToggleTranslation}
-            disabled={translationLoading}
-            aria-pressed={translationOn}
-            className={`min-h-[52px] w-full rounded-lg px-4 text-sm font-semibold text-white disabled:opacity-50 ${
-              translationOn ? "bg-warn" : "bg-ok"
+            disabled={translationBusy}
+            aria-pressed={translationActive}
+            aria-busy={translationLoading || undefined}
+            aria-label={
+              translationUnknown
+                ? "Translation state loading"
+                : translationActive
+                  ? "Pause translation — currently ON, each side hears only its tongue"
+                  : "Resume translation — currently OFF, direct conference audio"
+            }
+            title={translationActive ? "Select to pause translation" : "Select to resume translation"}
+            className={`flex min-h-[64px] w-full flex-col items-center justify-center gap-0.5 rounded-lg border px-4 py-2 text-base font-bold disabled:cursor-not-allowed ${
+              translationBusy
+                ? "border-line bg-paper text-muted disabled:opacity-100"
+                : translationActive
+                  ? "border-transparent bg-warn text-white"
+                  : "border-transparent bg-ok text-white"
             }`}
           >
-            {translationLoading ? "Working…" : translationOn ? "❚❚ Pause translation" : "▶ Resume translation"}
+            {translationBusy ? (
+              <span className="inline-flex items-center gap-2">
+                <CircleNotch aria-hidden weight="bold" className="h-5 w-5 animate-spin motion-reduce:animate-none" />
+                Loading translation state…
+              </span>
+            ) : translationActive ? (
+              <>
+                <span className="inline-flex items-center gap-2">
+                  <Translate aria-hidden weight="duotone" className="h-5 w-5" />
+                  Translation ON — each side hears only its tongue
+                </span>
+                <span className="inline-flex items-center gap-1 text-xs font-semibold opacity-90">
+                  <Pause aria-hidden weight="fill" className="h-4 w-4" />
+                  Select to pause
+                </span>
+              </>
+            ) : (
+              <>
+                <span className="inline-flex items-center gap-2">
+                  <Translate aria-hidden weight="duotone" className="h-5 w-5" />
+                  Translation OFF — direct conference audio
+                </span>
+                <span className="inline-flex items-center gap-1 text-xs font-semibold opacity-90">
+                  <Play aria-hidden weight="fill" className="h-4 w-4" />
+                  Select to resume
+                </span>
+              </>
+            )}
           </button>
-          <p className="mt-1 text-[11px] text-faint">Per-call toggle. Originals are always preserved.</p>
+          <p className="mt-1 text-[11px] text-faint">
+            Per-call toggle (same POST pauses / resumes). Originals are always preserved.
+          </p>
         </fieldset>
 
         {/* Response actions */}

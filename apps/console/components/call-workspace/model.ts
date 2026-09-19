@@ -238,6 +238,26 @@ export const CALLBACK_KEYS = ["callback", "callback_number", "caller", "from", "
 export const LOCATION_EVENT_KEYS = ["location", "address", "area"];
 export const NETWORK_KEYS = ["network_quality", "quality", "mos", "signal", "signal_strength", "rtt"];
 
+/**
+ * Latest `translation.suggested` for a call, if any.
+ *
+ * Reuses the same direct/linked matching as buildTimeline (event.callId or
+ * payload.call_id) plus the shared pStr helper — no duplicate parsing.
+ * Returns the suggested caller tongue for the mismatch nudge; null when absent.
+ */
+export function latestTranslationSuggestion(
+  events: LiveEvent[],
+  callId: string,
+): { language: string; at: string } | null {
+  const candidates = events.filter(
+    (e) => e.name === "translation.suggested" && (e.callId === callId || pStr(payloadOf(e), ["call_id"]) === callId),
+  );
+  if (candidates.length === 0) return null;
+  const latest = candidates.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0))[candidates.length - 1];
+  const language = pStr(payloadOf(latest), ["caller_language", "language", "detected_language"]) ?? "unknown";
+  return { language, at: latest.at };
+}
+
 /** Plain-text transcript for copy + Create-incident (originals, timestamped). */
 export function buildTranscriptText(entries: TimelineEntry[]): string {
   return entries

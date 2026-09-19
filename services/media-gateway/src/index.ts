@@ -280,6 +280,15 @@ if (adapter.kind === "saaras-realtime") {
         } catch {
           /* ignore */
         }
+        // Join enforcement pass (toggle defaults false => conference
+        // immediately so the joiner hears the live call at once).
+        // setOperatorProfile already fires one pass; this explicit pass covers
+        // ordering races. Idempotent via ARI skip; warn-never-break.
+        try {
+          void conversation.enforceConference?.(callerCallId)?.catch?.(() => undefined);
+        } catch {
+          /* ignore */
+        }
       },
       onCallTeardown: (callId) => {
         try {

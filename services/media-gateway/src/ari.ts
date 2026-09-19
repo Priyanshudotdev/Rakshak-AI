@@ -236,6 +236,12 @@ export class AriController {
   /** Partial throttle: one transcript.partial per call per 200 ms (~5/s) so a
    *  chatty STT never melts the dashboard. Finals bypass it (rare + must land). */
   private readonly partialThrottle = new PartialThrottle();
+  /** Toggle-driven conferencing: caller real bridge id -> last applied membership.
+   *  Desired membership = !translationToggle (OFF => conferenced, ON+unknown => separated).
+   *  Keyed by the caller leg's REAL Asterisk bridge id (1:1 with callerCallId).
+   *  Skip redundant REST; cleared on teardown and on new operator joins (so the
+   *  next enforcement pass applies to the fresh operator set). */
+  private readonly conferenceState = new Map<string, boolean>();
 
   constructor(hooks: AriHooks, opts: AriOptions = {}) {
     this.hooks = hooks;
@@ -323,6 +329,70 @@ export class AriController {
   /** Number of operators currently parked in the waiting room (test seam). */
   waitingCount(): number {
     return this.waitingTimers.size;
+  }
+
+  /** Toggle-driven conferencing (spec: translation toggle OFF or known tongue =>
+   *  DIRECT CONFERENCE; toggle ON + unknown tongue => SEPARATED).
+   *  Desired membership = !toggleEnabled (conversation layer ORs known-tongue),
+   *  enforced continuously from finals + join. In-flight utterances finish under
+   *  the old state: this only moves bridge membership, never preempts playback.
+   *  Failures warn-never-break: a failed add/remove logs and returns, never
+   *  throws, never breaks the call loop or teardown. Idempotent: redundant calls
+   *  for the same bridge+desired are skipped via conferenceState. */
+  async setOperatorConferenced(callerCallId: string, conferenced: boolean): Promise<void> {
+    try {
+      const callerLeg =
+        [...this.legs.values()].find((l) => l.callId === callerCallId) ??
+        [...this.legs.values()].find((l) => l.bridgeId === callerCallId && l.role === "caller");
+      if (!callerLeg) return;
+      const callerBridgeId = callerLeg.bridgeId;
+      // No REAL bridge yet (waiting-room placeholder) — nothing to mix.
+      if (!callerBridgeId || callerBridgeId.startsWith("waiting-")) return;
+      if (this.conferenceState.get(callerBridgeId) === conferenced) return;
+      const ops = [...this.legs.values()].filter((l) => l.role === "operator" && l.bridgeId === callerBridgeId);
+      if (ops.length === 0) return;
+      let allOk = true;
+      for (const op of ops) {
+        try {
+          if (conferenced) {
+            await this.rest("POST", `bridges/${encodeURIComponent(callerBridgeId)}/addChannel`, {
+              channel: [op.channelId],
+            });
+          } else {
+            await this.rest("POST", `bridges/${encodeURIComponent(callerBridgeId)}/removeChannel`, {
+              channel: [op.channelId],
+            });
+          }
+        } catch (err) {
+          allOk = false;
+          this.hooks.log("warn", "conference membership change failed", {
+            callerCallId,
+            bridgeId: callerBridgeId,
+            opChannel: op.channelId,
+            conferenced,
+            err: String(err),
+          });
+        }
+      }
+      // Only record on full success so the next final retries after a failure.
+      if (allOk) this.conferenceState.set(callerBridgeId, conferenced);
+    } catch (err) {
+      this.hooks.log("warn", "setOperatorConferenced failed", { callerCallId, conferenced, err: String(err) });
+    }
+  }
+
+  /** Last applied conferencing state for a caller call/bridge (test seam). */
+  getConferencedState(callerCallIdOrBridge: string): boolean | undefined {
+    const leg = [...this.legs.values()].find(
+      (l) => l.callId === callerCallIdOrBridge || l.bridgeId === callerCallIdOrBridge,
+    );
+    const bridgeId = leg ? leg.bridgeId : callerCallIdOrBridge;
+    return this.conferenceState.get(bridgeId);
+  }
+
+  /** Number of tracked conference entries (test seam: teardown clears). */
+  conferenceCount(): number {
+    return this.conferenceState.size;
   }
 
   private api(path: string): string {
@@ -490,10 +560,11 @@ export class AriController {
   /** DID-routed operator flow: answer + STT fork from the start, join the
    *  newest live caller bridge, or park in the waiting room (hold message +
    *  5s poll up to 10min) when nobody is waiting.
-   *  Translation-only audio: the operator channel is NEVER added to the
-   *  caller mixing bridge (raw voices would stack). Operator hears
-   *  caller/AI via directed playReply into the OPERATOR channel;
-   *  caller hears operator via renditions into the CALLER channel. */
+   *  Toggle-driven conferencing: the operator channel joins LOGICALLY here
+   *  (bridgeId link so bridgePeer() routes translations). Physical mixing is
+   *  owned by setOperatorConferenced (translation toggle OFF or known tongue
+   *  => added to the caller mixing bridge for direct conference; toggle ON +
+   *  unknown tongue => kept out, translation-only renditions via playReply). */
   private async setupOperatorFlow(channelId: string, caller: string, profile: OperatorProfile): Promise<void> {
     const callId = `ARI-OP-${channelId.slice(0, 8).toUpperCase()}`;
     const fork = await this.forkMedia(callId, channelId, "operator");
@@ -551,11 +622,13 @@ export class AriController {
   private async attachOperatorToCaller(operatorChannelId: string, target: Leg, profile: OperatorProfile): Promise<void> {
     const leg = this.legs.get(operatorChannelId);
     if (!leg) return;
-    // Translation-only: NEVER add the operator channel (or its STT fork) to
-    // the caller mixing bridge — raw voices would stack. Link logically so
-    // bridgePeer() still routes translations; audio flows only via directed
-    // playReply renditions into each leg's own channel.
+    // Logical join only: link bridgeId so bridgePeer() routes translations.
+    // Physical mixing is owned by setOperatorConferenced (toggle-driven).
+    // Reset applied state so the join enforcement pass (conversation layer,
+    // toggle defaults false => conference) applies to the fresh operator set
+    // instead of being skipped as redundant.
     leg.bridgeId = target.bridgeId;
+    this.conferenceState.delete(target.bridgeId);
     const callerCallId = target.callId;
     const operatorCallId = leg.callId;
     this.operatorProfiles.set(operatorCallId, profile);
@@ -628,7 +701,8 @@ export class AriController {
   }
 
   /** Operator join (1001 dials 9002): own STT fork like a caller, then linked
-   *  to the newest live emergency bridge (translation-only, never mixed).
+   *  to the newest live emergency bridge (logical join; physical mixing is
+   *  toggle-driven via setOperatorConferenced).
    *  Operator speech is transcribed with role=operator so it translates
    *  toward the caller — never as incidents.
    *  Nobody waiting: polite hangup, the dashboard shows nothing to join. */
@@ -643,9 +717,9 @@ export class AriController {
     const callId = `ARI-OP-${channelId.slice(0, 8).toUpperCase()}`;
     const fork = await this.forkMedia(callId, channelId, "operator");
     await this.rest("POST", `channels/${encodeURIComponent(channelId)}/answer`);
-    // Translation-only: operator channel + fork stay OUT of the caller bridge.
-    // Link logically so bridgePeer() routes translations; audio flows only
-    // via directed playReply renditions.
+    // Logical join only (toggle-driven mixing via setOperatorConferenced).
+    // Reset applied state so join enforcement conferences the fresh leg.
+    this.conferenceState.delete(target.bridgeId);
     this.legs.set(channelId, {
       callId,
       channelId,
@@ -1088,6 +1162,10 @@ export class AriController {
     }
     if (leg.role === "operator") {
       // Operator leaves: free only their channel + private tap, the emergency leg continues.
+      // Clear conferencing state when no operators remain on the bridge so the
+      // next join enforcement re-applies instead of skipping as redundant.
+      // A failed clear must never break teardown (Map.delete never throws).
+      const opBridge = leg.bridgeId;
       this.operatorProfiles.delete(leg.callId);
       try {
         this.hooks.onCallTeardown?.(leg.callId, leg.role, leg.bridgeId);
@@ -1109,6 +1187,12 @@ export class AriController {
         }
       }
       this.hooks.publish("call.ended", leg.callId, { reason: "operator-left" });
+      try {
+        const stillJoined = [...this.legs.values()].some((l) => l.role === "operator" && l.bridgeId === opBridge);
+        if (!stillJoined) this.conferenceState.delete(opBridge);
+      } catch {
+        /* never break teardown */
+      }
       return;
     }
     // Caller leaves: clear joined operators first so nobody listens to dead air.
@@ -1160,9 +1244,15 @@ export class AriController {
       }
     }
     // Clear per-call caches (toggle entries live in conversation via the hook;
-    // profile entries live here).
+    // profile entries live here; conferencing membership here).
     this.operatorProfiles.delete(callerCallId);
     this.operatorProfiles.delete(bridgeId);
+    try {
+      this.conferenceState.delete(bridgeId);
+      this.conferenceState.delete(callerCallId);
+    } catch {
+      /* never break teardown */
+    }
     try {
       this.hooks.onCallTeardown?.(callerCallId, leg.role, bridgeId);
     } catch {

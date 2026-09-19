@@ -22,6 +22,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
+import { Translate, X } from "@phosphor-icons/react";
 import { Shell } from "@/components/shell";
 import { deriveCalls, primaryLanguage, useLiveEvents } from "@/lib/live";
 import {
@@ -44,6 +45,7 @@ import {
   buildTranscriptText,
   CALLBACK_KEYS,
   firstPayloadString,
+  latestTranslationSuggestion,
   LOCATION_EVENT_KEYS,
   maskCaller,
   NETWORK_KEYS,
@@ -56,7 +58,7 @@ function SkeletonCol(): React.ReactElement {
   return (
     <div className="flex flex-col gap-2 rounded-xl2 bg-card p-4 shadow-card" aria-hidden="true">
       {[0, 1, 2, 3, 4].map((i) => (
-        <div key={i} className="h-10 animate-pulse rounded-lg bg-paper" />
+        <div key={i} className="h-10 animate-pulse rounded-lg bg-paper motion-reduce:animate-none" />
       ))}
     </div>
   );
@@ -67,9 +69,12 @@ export default function LiveCallPage({ params }: { params: { callId: string } })
   const router = useRouter();
   const feed = useLiveEvents();
 
-  const [translationOn, setTranslationOn] = useState(true);
+  // null = unknown / not yet loaded. Backend default is OFF — never assume ON.
+  // Treat null as OFF for safety-critical gating, display as loading.
+  const [translationOn, setTranslationOn] = useState<boolean | null>(null);
   const [translationLoading, setTranslationLoading] = useState(true);
   const [translationError, setTranslationError] = useState<string | null>(null);
+  const [suggestionDismissed, setSuggestionDismissed] = useState(false);
 
   const [profile, setProfile] = useState<OperatorProfile | null>(null);
   const [profilePending, setProfilePending] = useState(false);
@@ -106,6 +111,16 @@ export default function LiveCallPage({ params }: { params: { callId: string } })
   const location = call?.location ?? record?.extraction?.location ?? firstPayloadString(feed.events, callId, LOCATION_EVENT_KEYS) ?? "Unknown";
   const networkQuality = firstPayloadString(feed.events, callId, NETWORK_KEYS) ?? "—";
   const category = call?.incidentType ?? record?.extraction?.incident_type ?? "Unknown — pending AI brief";
+
+  // Mismatch nudge: latest translation.suggested for this call (reuses model helper).
+  const suggestion = useMemo(() => latestTranslationSuggestion(feed.events, callId), [feed.events, callId]);
+  // Show only while the toggle is OFF/unknown — never when ON is confirmed.
+  const showSuggestion = !!suggestion && translationOn !== true && !suggestionDismissed;
+
+  // Re-arm the nudge when the call or the suggested tongue changes.
+  useEffect(() => {
+    setSuggestionDismissed(false);
+  }, [callId, suggestion?.language]);
 
   // ---- effects: translation toggle / profile / devices ----
   useEffect(() => {
@@ -158,7 +173,8 @@ export default function LiveCallPage({ params }: { params: { callId: string } })
 
   // ---- actions ----
   const toggleTranslation = useCallback(() => {
-    const next = !translationOn;
+    // Unknown behaves as OFF: flipping enables. Same POST pauses/resumes.
+    const next = translationOn !== true;
     setTranslationLoading(true);
     setTranslation(callId, next)
       .then((t) => {
@@ -281,8 +297,9 @@ export default function LiveCallPage({ params }: { params: { callId: string } })
           >
             {feed.status === "live" ? "● Live" : `● ${feed.status} (retry ${feed.retryCount})`}
           </span>
-          <span className="rounded-full border border-line bg-paper px-2.5 py-1 font-semibold text-muted">
-            Translation {translationLoading ? "…" : translationOn ? "ON" : "OFF"}
+          <span className="inline-flex items-center gap-1 rounded-full border border-line bg-paper px-2.5 py-1 font-semibold text-muted">
+            <Translate size={14} aria-hidden weight="duotone" className="text-muted" />
+            Translation {translationOn === null || translationLoading ? "…" : translationOn ? "ON" : "OFF"}
           </span>
         </span>
       }
@@ -328,6 +345,39 @@ export default function LiveCallPage({ params }: { params: { callId: string } })
             </p>
           )}
           {actionError && !translationError && !profileError && <p>{actionError}</p>}
+        </div>
+      )}
+
+      {showSuggestion && suggestion && (
+        <div
+          role="status"
+          aria-label="Translation suggestion"
+          className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-warn/30 bg-warnbg px-3 py-2 text-sm text-ink"
+        >
+          <Translate size={18} aria-hidden weight="duotone" className="shrink-0 text-warn" />
+          <p className="min-w-0 flex-1">
+            <span className="font-semibold">Translation suggested</span> — Caller speaks {suggestion.language} — enable
+            translation?
+            {translationOn === null && <span className="ml-1 text-muted">(loading current state…)</span>}
+          </p>
+          <button
+            type="button"
+            onClick={toggleTranslation}
+            disabled={translationLoading}
+            className="inline-flex min-h-[48px] items-center gap-1.5 rounded-lg bg-primary px-4 text-sm font-semibold text-white disabled:opacity-60"
+          >
+            <Translate size={16} aria-hidden weight="duotone" />
+            {translationLoading ? "Working…" : "Enable translation"}
+          </button>
+          <button
+            type="button"
+            onClick={() => setSuggestionDismissed(true)}
+            aria-label="Dismiss translation suggestion"
+            className="inline-flex min-h-[48px] items-center gap-1 rounded-lg border border-line bg-card px-3 text-sm font-medium text-ink"
+          >
+            <X size={16} aria-hidden weight="bold" />
+            Dismiss
+          </button>
         </div>
       )}
 

@@ -314,7 +314,7 @@ describe("AriController", () => {
     expect(ctx.published[0]).toMatchObject({ name: "call.ended", callId: expect.stringContaining("ARI-OP-") });
   });
 
-  it("forks operator audio too and joins the same bridge", async () => {
+  it("forks operator audio too and joins logically; conferencing via setOperatorConferenced (toggle OFF => direct conference; was never-bridged)", async () => {
     const ctx = setup();
     await startCall(ctx);
     await startOperator(ctx);
@@ -324,7 +324,9 @@ describe("AriController", () => {
     expect(ctx.calls.filter((c) => c.url.includes("/snoop"))).toHaveLength(2);
     // 1 caller bridge + 2 tap bridges (caller tap + operator tap).
     expect(ctx.calls.filter((c) => c.method === "POST" && c.url.split("?")[0].endsWith("/bridges"))).toHaveLength(3);
-    // Translation-only: operator channel NEVER added to the caller bridge.
+    // New semantics (was: translation-only NEVER added): initial join is
+    // logical-only (no immediate mix); physical mixing is toggle-driven via
+    // setOperatorConferenced. Verify the logical-only initial state here.
     const adds = ctx.calls.filter((c) => c.url.includes("addChannel"));
     const callerBridgeAdds = adds.filter((c) => JSON.stringify(c.body).includes("chan-abc-12345678"));
     expect(callerBridgeAdds).toHaveLength(1);
@@ -337,7 +339,19 @@ describe("AriController", () => {
     expect(ctx.published).toContainEqual(expect.objectContaining({ name: "call.answered", callId: expect.stringContaining("ARI-OP-") }));
     // Logical join still routes translations + publishes the live event.
     expect(ctx.published).toContainEqual(expect.objectContaining({ name: "operator.joined" }));
-    expect(ctx.controller.bridgePeer(ctx.published.find((p) => p.name === "call.answered" && !p.callId.includes("OP-"))!.callId)).toBeTruthy();
+    const callerCallId = ctx.published.find((p) => p.name === "call.answered" && !p.callId.includes("OP-"))!.callId;
+    expect(ctx.controller.bridgePeer(callerCallId)).toBeTruthy();
+    // Toggle OFF (default) => direct conference: enforcement adds the operator
+    // channel to the caller's REAL bridge (same bridge id as the caller add).
+    await ctx.controller.setOperatorConferenced(callerCallId, true);
+    const callerBridgeUrl = String(callerBridgeAdds[0]?.url ?? "");
+    const callerBridgeId = callerBridgeUrl.split("/ari/bridges/")[1]?.split("/")[0]?.split("?")[0] ?? "";
+    expect(callerBridgeId).toBeTruthy();
+    const confAdds = ctx.calls.filter((c) => c.url.includes("addChannel") && JSON.stringify(c.body).includes("op-chan-01"));
+    expect(confAdds).toHaveLength(1);
+    expect(confAdds[0]?.body).toEqual({ channel: ["op-chan-01"] });
+    expect(String(confAdds[0]?.url)).toContain(`bridges/${callerBridgeId}/addChannel`);
+    await ctx.controller.shutdown();
   });
 
   it("operator hangup leaves the emergency leg alive; caller hangup clears all", async () => {
@@ -560,7 +574,7 @@ describe("DID operator routing", () => {
     await ctx.controller.shutdown();
   });
 
-  it("lookup hit with live caller -> operator flow joins same bridge", async () => {
+  it("lookup hit with live caller -> operator flow joins logically; conferencing via setOperatorConferenced (was never-mixed)", async () => {
     const ctx = setupDid({
       lookup: (mobile) => (mobile === OP_MOBILE ? { status: 200, body: OP_PROFILE } : { status: 404, body: {} }),
     });
@@ -575,7 +589,8 @@ describe("DID operator routing", () => {
     expect(ctx.calls.filter((c) => c.url.includes("/snoop"))).toHaveLength(2);
     // 1 caller bridge + 2 per-leg tap bridges.
     expect(ctx.calls.filter((c) => c.method === "POST" && c.url.split("?")[0].endsWith("/bridges"))).toHaveLength(3);
-    // Translation-only: operator channel never mixed into the caller bridge.
+    // New semantics (was: translation-only never mixed): initial join is
+    // logical-only; physical mixing is toggle-driven via setOperatorConferenced.
     const adds = ctx.calls.filter((c) => c.url.includes("addChannel"));
     expect(adds.some((c) => {
       const chans = (c.body as { channel?: string[] })?.channel ?? [];
@@ -592,6 +607,12 @@ describe("DID operator routing", () => {
     const joined = ctx.published.find((p) => p.name === "operator.joined");
     expect(joined).toBeTruthy();
     expect(joined?.payload).toMatchObject({ call_id: callerCallId, operator_id: "OP-1" });
+    // Toggle OFF => direct conference adds the operator to the caller bridge.
+    await ctx.controller.setOperatorConferenced(callerCallId!, true);
+    expect(ctx.calls.filter((c) => c.url.includes("addChannel")).some((c) => {
+      const chans = (c.body as { channel?: string[] })?.channel ?? [];
+      return chans.includes("chan-op-did-01");
+    })).toBe(true);
     await ctx.controller.shutdown();
   });
 
@@ -616,7 +637,8 @@ describe("DID operator routing", () => {
     );
     expect(ctx.controller.waitingCount()).toBe(1);
     expect(ctx.calls.some((c) => c.url.includes("chan-op-wait-01/hangup"))).toBe(false);
-    // A caller arrives on the same DID: the poll joins the operator (logically, never mixed).
+    // A caller arrives on the same DID: the poll joins the operator logically
+    // (physical mixing is toggle-driven via setOperatorConferenced; was never mixed).
     ctx.socket().emit("message", stasisStart("chan-caller-late-01", "9000000002", "9000"));
     await new Promise((r) => setTimeout(r, 120));
     expect(ctx.controller.waitingCount()).toBe(0);
@@ -627,6 +649,12 @@ describe("DID operator routing", () => {
       return chans.includes("chan-op-wait-01");
     })).toBe(false);
     expect(ctx.published).toContainEqual(expect.objectContaining({ name: "operator.joined" }));
+    const lateCallerId = ctx.published.find((p) => p.name === "call.answered" && !p.callId.includes("OP-"))?.callId!;
+    await ctx.controller.setOperatorConferenced(lateCallerId, true);
+    expect(ctx.calls.filter((c) => c.url.includes("addChannel")).some((c) => {
+      const chans = (c.body as { channel?: string[] })?.channel ?? [];
+      return chans.includes("chan-op-wait-01");
+    })).toBe(true);
     await ctx.controller.shutdown();
   });
 
@@ -740,7 +768,7 @@ describe("translation-only audio + snoop taps", () => {
     });
   }
 
-  it("operator channel NOT added to caller bridge (9002 path stays translation-only)", async () => {
+  it("operator channel conferenced via setOperatorConferenced (9002 path was translation-only, now toggle-driven direct conference)", async () => {
     const ctx = setupTap();
     await ctx.controller.start();
     ctx.socket().emit("message", stasis("chan-caller-t1", "PJSIP/9000-00000001", "9000000009", "9000"));
@@ -752,13 +780,16 @@ describe("translation-only audio + snoop taps", () => {
     const callerAdds = adds.filter((c) => JSON.stringify(c.body).includes("chan-caller-t1"));
     expect(callerAdds).toHaveLength(1);
     expect(callerAdds[0]?.body).toEqual({ channel: ["chan-caller-t1"] });
-    // Operator voice channel never appears in any bridge add.
+    // New semantics (was: never added): initial join is logical-only, then
+    // toggle OFF => direct conference adds the operator voice channel.
     expect(adds.some((c) => JSON.stringify(c.body).includes("chan-op-t1"))).toBe(false);
     // …but the logical pairing still routes translations both ways.
     const callerCallId = ctx.published.find((p) => p.name === "call.answered" && !p.callId.includes("OP-"))?.callId!;
     const opCallId = ctx.published.find((p) => p.name === "call.answered" && p.callId.includes("OP-"))?.callId!;
     expect(ctx.controller.bridgePeer(callerCallId)).toMatchObject({ callId: opCallId });
     expect(ctx.controller.bridgePeer(opCallId)).toMatchObject({ callId: callerCallId });
+    await ctx.controller.setOperatorConferenced(callerCallId, true);
+    expect(ctx.calls.filter((c) => c.url.includes("addChannel")).some((c) => JSON.stringify(c.body).includes("chan-op-t1"))).toBe(true);
     await ctx.controller.shutdown();
   });
 
@@ -837,6 +868,173 @@ describe("translation-only audio + snoop taps", () => {
     const joined = ctx.published.find((p) => p.name === "operator.joined");
     expect(joined).toBeTruthy();
     expect(joined?.payload).toMatchObject({ operator_id: "OP-9" });
+    await ctx.controller.shutdown();
+  });
+});
+
+describe("operator conferencing (toggle-driven direct conference)", () => {
+  const OP_MOBILE = "+919876543210";
+  const OP_PROFILE = { operator_id: "OP-C", default_language: "en-IN", known_languages: ["en"] };
+
+  function setupConf(opts: { failAddRemove?: boolean } = {}) {
+    const calls: Array<{ method: string; url: string; body: unknown }> = [];
+    let ext = 0;
+    let snoops = 0;
+    let bridges = 0;
+    const warnings: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+    const fetchFn = vi.fn(async (url: string, init: { method?: string; body?: string }) => {
+      const body = init.body ? JSON.parse(init.body as string) : undefined;
+      calls.push({ method: init.method ?? "GET", url: String(url), body });
+      const u = String(url);
+      if (u.includes("/api/operators/lookup")) {
+        const mobile = new URL(u).searchParams.get("mobile") ?? "";
+        if (mobile === OP_MOBILE) return { ok: true, status: 200, json: async () => OP_PROFILE };
+        return { ok: false, status: 404, json: async () => ({}) };
+      }
+      // Fail only the conferencing membership moves (operator voice channel),
+      // never the per-leg tap setup (snoop+fork) so the join itself succeeds.
+      if (opts.failAddRemove && (u.includes("/addChannel") || u.includes("/removeChannel"))) {
+        if (JSON.stringify(body ?? {}).includes("chan-conf-op")) throw new Error("asterisk down");
+      }
+      if (u.includes("/channels/externalMedia")) {
+        ext += 1;
+        return { ok: true, json: async () => ({ id: `ext-conf-${ext}` }) };
+      }
+      if (u.includes("/snoop")) {
+        snoops += 1;
+        return { ok: true, json: async () => ({ id: `snoop-conf-${snoops}` }) };
+      }
+      if (u.includes("/bridges") && (init.method ?? "GET") === "POST" && !u.includes("addChannel") && !u.includes("removeChannel")) {
+        bridges += 1;
+        return { ok: true, json: async () => ({ id: `bridge-conf-${bridges}` }) };
+      }
+      return { ok: true, json: async () => ({}) };
+    });
+    const adapter: RealtimeAdapter = {
+      kind: "test",
+      connect: async () => ({ sendAudio: () => undefined, close: () => undefined }),
+    };
+    const published: Array<{ name: string; callId: string; payload?: unknown }> = [];
+    let socket: FakeSocket | null = null;
+    const controller = new AriController(
+      {
+        adapter,
+        publish: (name, callId, payload) => void published.push({ name, callId, payload }),
+        log: (level, msg, fields) => {
+          if (level === "warn") warnings.push({ msg, fields });
+        },
+        synthesize: async () => null,
+      },
+      {
+        baseUrl: "http://asterisk:8088",
+        apiUrl: "http://api:3001",
+        rtpHost: "127.0.0.1",
+        rtpPortBase: 39000 + Math.floor(Math.random() * 2000),
+        createSocket: () => {
+          socket = new FakeSocket();
+          setTimeout(() => socket!.emit("open"), 0);
+          return socket;
+        },
+        fetchFn: fetchFn as unknown as typeof fetch,
+      },
+    );
+    return { controller, calls, published, warnings, socket: () => socket as unknown as FakeSocket };
+  }
+
+  function stasisConf(channelId: string, name: string, caller: string, exten: string) {
+    return JSON.stringify({
+      type: "StasisStart",
+      channel: { id: channelId, name, caller: { number: caller } },
+      args: [exten],
+    });
+  }
+
+  async function joinCallerAndOperator(ctx: ReturnType<typeof setupConf>) {
+    await ctx.controller.start();
+    ctx.socket().emit("message", stasisConf("chan-conf-caller", "PJSIP/caller-00000001", "9000000099", "9000"));
+    await new Promise((r) => setTimeout(r, 60));
+    ctx.socket().emit("message", stasisConf("chan-conf-op", "PJSIP/op-00000001", "9876543210", "9000"));
+    await new Promise((r) => setTimeout(r, 80));
+    const callerCallId = ctx.published.find((p) => p.name === "call.answered" && !p.callId.includes("OP-"))?.callId!;
+    expect(callerCallId).toBeTruthy();
+    return callerCallId;
+  }
+
+  it("join-with-toggle-OFF adds operator to caller bridge", async () => {
+    const ctx = setupConf();
+    const callerCallId = await joinCallerAndOperator(ctx);
+    await ctx.controller.setOperatorConferenced(callerCallId, true);
+    const adds = ctx.calls.filter((c) => c.url.includes("/addChannel"));
+    expect(adds).toHaveLength(2 + 1 + 1); // 2 tap adds + 1 caller add + 1 conference add
+    const conf = adds.find((c) => JSON.stringify(c.body).includes("chan-conf-op"));
+    expect(conf?.body).toEqual({ channel: ["chan-conf-op"] });
+    expect(String(conf?.url)).toContain("/addChannel");
+    expect(ctx.controller.getConferencedState(callerCallId)).toBe(true);
+    await ctx.controller.shutdown();
+  });
+
+  it("toggle-ON removes; OFF-again re-adds", async () => {
+    const ctx = setupConf();
+    const callerCallId = await joinCallerAndOperator(ctx);
+    await ctx.controller.setOperatorConferenced(callerCallId, true);
+    const addsAfterOn = ctx.calls.filter((c) => c.url.includes("/addChannel") && JSON.stringify(c.body).includes("chan-conf-op")).length;
+    expect(addsAfterOn).toBe(1);
+    await ctx.controller.setOperatorConferenced(callerCallId, false);
+    const removes = ctx.calls.filter((c) => c.url.includes("/removeChannel"));
+    expect(removes).toHaveLength(1);
+    expect(removes[0]?.body).toEqual({ channel: ["chan-conf-op"] });
+    expect(ctx.controller.getConferencedState(callerCallId)).toBe(false);
+    await ctx.controller.setOperatorConferenced(callerCallId, true);
+    const addsAgain = ctx.calls.filter((c) => c.url.includes("/addChannel") && JSON.stringify(c.body).includes("chan-conf-op"));
+    expect(addsAgain).toHaveLength(2);
+    expect(ctx.controller.getConferencedState(callerCallId)).toBe(true);
+    await ctx.controller.shutdown();
+  });
+
+  it("idempotent: no duplicate add/remove on repeated enforcement", async () => {
+    const ctx = setupConf();
+    const callerCallId = await joinCallerAndOperator(ctx);
+    await ctx.controller.setOperatorConferenced(callerCallId, true);
+    await ctx.controller.setOperatorConferenced(callerCallId, true);
+    await ctx.controller.setOperatorConferenced(callerCallId, true);
+    expect(ctx.calls.filter((c) => c.url.includes("/addChannel") && JSON.stringify(c.body).includes("chan-conf-op"))).toHaveLength(1);
+    await ctx.controller.setOperatorConferenced(callerCallId, false);
+    await ctx.controller.setOperatorConferenced(callerCallId, false);
+    expect(ctx.calls.filter((c) => c.url.includes("/removeChannel"))).toHaveLength(1);
+    await ctx.controller.shutdown();
+  });
+
+  it("failed add/remove warns without breaking the call loop", async () => {
+    const ctx = setupConf({ failAddRemove: true });
+    const callerCallId = await joinCallerAndOperator(ctx);
+    // Must never throw; legs stay alive (bridgePeer still routes).
+    await expect(ctx.controller.setOperatorConferenced(callerCallId, true)).resolves.toBeUndefined();
+    await expect(ctx.controller.setOperatorConferenced(callerCallId, false)).resolves.toBeUndefined();
+    expect(ctx.warnings.some((w) => w.msg.includes("conference membership"))).toBe(true);
+    expect(ctx.controller.bridgePeer(callerCallId)).toBeTruthy();
+    // No state recorded on failure so the next pass retries (still undefined).
+    expect(ctx.controller.getConferencedState(callerCallId)).toBeUndefined();
+    await ctx.controller.shutdown();
+  });
+
+  it("teardown clears membership state", async () => {
+    const ctx = setupConf();
+    const callerCallId = await joinCallerAndOperator(ctx);
+    await ctx.controller.setOperatorConferenced(callerCallId, true);
+    expect(ctx.controller.conferenceCount()).toBe(1);
+    // Operator leaves: state cleared when the bridge empties of operators.
+    ctx.socket().emit("message", JSON.stringify({ type: "StasisEnd", channel: { id: "chan-conf-op" } }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(ctx.controller.conferenceCount()).toBe(0);
+    // Re-join a fresh operator and conference again: must NOT skip as redundant.
+    ctx.socket().emit("message", stasisConf("chan-conf-op2", "PJSIP/op-00000002", "9876543210", "9000"));
+    await new Promise((r) => setTimeout(r, 80));
+    await ctx.controller.setOperatorConferenced(callerCallId, true);
+    expect(ctx.calls.filter((c) => c.url.includes("/addChannel") && JSON.stringify(c.body).includes("chan-conf-op2"))).toHaveLength(1);
+    // Caller leaves: everything cleared.
+    ctx.socket().emit("message", JSON.stringify({ type: "StasisEnd", channel: { id: "chan-conf-caller" } }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(ctx.controller.conferenceCount()).toBe(0);
     await ctx.controller.shutdown();
   });
 });

@@ -1,13 +1,15 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Check, CircleNotch, Copy, Pause, Play, SpeakerHigh } from "@phosphor-icons/react";
 import { synthesize, translate } from "@/lib/api";
 import { buildTranscriptText, formatClock, toVoiceCode, type TimelineEntry } from "./model";
 import { playBase64 } from "./playback";
 
 interface TimelinePanelProps {
   entries: TimelineEntry[];
-  translationOn: boolean;
+  // null = unknown / not yet loaded — treated as OFF for gating, shown as loading.
+  translationOn: boolean | null;
   operatorTongue: string;
   /** Caller language override ("auto" = live auto-detect); used as translate source hint + TTS fallback. */
   callerLang: string;
@@ -43,10 +45,13 @@ export function TimelinePanel({ entries, translationOn, operatorTongue, callerLa
 
   const utterances = useMemo(() => entries.filter((e) => e.kind === "utterance"), [entries]);
   const finals = utterances;
+  // Safety-critical gating: null (unknown) behaves as OFF — never fetch renditions until ON is confirmed.
+  const translationActive = translationOn === true;
+  const translationUnknown = translationOn === null;
 
   // Fetch missing renditions while the toggle is ON.
   useEffect(() => {
-    if (!translationOn) return;
+    if (!translationActive) return;
     let cancelled = false;
     const missing = finals.filter((e) => !e.translated && !renditions[e.key]);
     if (missing.length === 0) return;
@@ -78,7 +83,7 @@ export function TimelinePanel({ entries, translationOn, operatorTongue, callerLa
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [finals, translationOn, operatorTongue, callerLang]);
+  }, [finals, translationActive, operatorTongue, callerLang]);
 
   const retryTranslations = (): void => {
     setRenditions((prev) => {
@@ -176,27 +181,52 @@ export function TimelinePanel({ entries, translationOn, operatorTongue, callerLa
           onClick={() => setAutoScroll((v) => !v)}
           aria-pressed={autoScroll}
           title={ended ? "Timeline frozen — call ended" : "Follow new messages"}
-          className="min-h-[40px] rounded-lg border border-line px-3 text-sm font-medium text-ink"
+          className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-line px-3 text-sm font-medium text-ink"
         >
-          {autoScroll ? "❚❚ Pause" : "▶ Follow"}
+          {autoScroll ? (
+            <>
+              <Pause aria-hidden weight="fill" className="h-4 w-4" />
+              Pause
+            </>
+          ) : (
+            <>
+              <Play aria-hidden weight="fill" className="h-4 w-4" />
+              Follow
+            </>
+          )}
         </button>
         <button
           type="button"
           onClick={() => void onCopy()}
           disabled={utterances.length === 0}
-          className="min-h-[40px] rounded-lg border border-line px-3 text-sm font-medium text-ink disabled:opacity-50"
+          className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-line px-3 text-sm font-medium text-ink disabled:opacity-50"
         >
-          {copied ? "Copied ✓" : "Copy transcript"}
+          {copied ? (
+            <>
+              <Check aria-hidden weight="bold" className="h-4 w-4" />
+              Copied
+            </>
+          ) : (
+            <>
+              <Copy aria-hidden className="h-4 w-4" />
+              Copy transcript
+            </>
+          )}
         </button>
       </div>
 
       {/* Degraded-mode banners: originals are always preserved. */}
-      {!translationOn && (
+      {translationUnknown && (
+        <div role="status" className="mt-3 rounded-lg border border-line bg-paper px-3 py-2 text-sm text-muted">
+          Loading translation state… — showing original utterances until the toggle resolves.
+        </div>
+      )}
+      {translationOn === false && (
         <div role="status" className="mt-3 rounded-lg border border-warn/30 bg-warnbg px-3 py-2 text-sm text-warn">
           Translation paused — showing original utterances. Resume it from the call controls below.
         </div>
       )}
-      {translationOn && translateErrors > 0 && (
+      {translationActive && translateErrors > 0 && (
         <div role="alert" className="mt-3 rounded-lg border border-danger/30 bg-dangerbg px-3 py-2 text-sm text-danger">
           Translation service errored on {translateErrors} utterance(s) — originals preserved.{" "}
           <button type="button" onClick={retryTranslations} className="font-semibold underline">
@@ -251,7 +281,7 @@ export function TimelinePanel({ entries, translationOn, operatorTongue, callerLa
                   return (
                     <div className="mt-1.5">
                       <p className="text-sm text-ink">{primary}</p>
-                      {view === "translated" && !rendition && translationOn && (
+                      {view === "translated" && !rendition && translationActive && (
                         <p className="mt-0.5 text-xs italic text-muted" aria-label="Translation in progress">
                           {pending ? "Translating…" : "No rendition yet — original shown."}
                         </p>
@@ -266,9 +296,24 @@ export function TimelinePanel({ entries, translationOn, operatorTongue, callerLa
                     onClick={() => void onPlay(e)}
                     disabled={loadingKey === e.key}
                     aria-label={`Play utterance from ${e.speaker} at ${formatClock(e.at)}`}
-                    className="min-h-[36px] rounded-md border border-line px-2.5 text-xs font-medium text-ink disabled:opacity-50"
+                    className="inline-flex min-h-[36px] items-center gap-1.5 rounded-md border border-line px-2.5 text-xs font-medium text-ink disabled:opacity-50"
                   >
-                    {loadingKey === e.key ? "Synthesizing…" : playingKey === e.key ? "Playing… ◉" : "▶ Play"}
+                    {loadingKey === e.key ? (
+                      <>
+                        <CircleNotch aria-hidden weight="bold" className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" />
+                        Synthesizing…
+                      </>
+                    ) : playingKey === e.key ? (
+                      <>
+                        <SpeakerHigh aria-hidden weight="duotone" className="h-3.5 w-3.5" />
+                        Playing…
+                      </>
+                    ) : (
+                      <>
+                        <Play aria-hidden weight="fill" className="h-3.5 w-3.5" />
+                        Play
+                      </>
+                    )}
                   </button>
                 </div>
               </li>

@@ -110,7 +110,10 @@ export function createConversation(deps: ConversationDeps) {
     }
   }
 
-  /** Cache an operator profile for a caller call (called at join). */
+  /** Cache an operator profile for a caller call (called at join).
+   *  Triggers one conferencing enforcement pass (fire-and-forget,
+   *  warn-never-break): toggle defaults false => conference immediately so the
+   *  joiner hears the live call at once. */
   function setOperatorProfile(callerCallId: string, profile: OperatorProfile): void {
     if (!callerCallId || !profile?.operator_id) return;
     profileByCall.set(callerCallId, {
@@ -118,6 +121,11 @@ export function createConversation(deps: ConversationDeps) {
       default_language: profile.default_language || deps.operatorLang,
       known_languages: Array.isArray(profile.known_languages) ? [...profile.known_languages] : [],
     });
+    try {
+      void enforceConference(callerCallId);
+    } catch {
+      /* enforcement never breaks the join */
+    }
   }
 
   function getOperatorProfile(callerCallId: string): OperatorProfile | null {
@@ -204,6 +212,14 @@ export function createConversation(deps: ConversationDeps) {
       const callerChannel = peer ? ari.channelForCall(peer.callId) : null;
       if (!callerChannel) return;
       await translateAndSpeak(callerChannel, text, replyVoice(callerLang).code, effLang);
+      // Conferencing enforcement for the caller call (desired = !toggle,
+      // OR known-tongue => conference). After the rendition so in-flight
+      // utterances finish under the old state; warn-never-break.
+      try {
+        if (peer) await enforceConference(peer.callId, langByCall.get(peer.callId), callId);
+      } catch (err) {
+        deps.log("warn", "conference enforcement failed", { callId, err: String(err) });
+      }
       return;
     }
     const voice = replyVoice(effLang);
@@ -243,33 +259,93 @@ export function createConversation(deps: ConversationDeps) {
     }
     // Caller->operator rendition (translation toggle): AFTER the existing
     // logic so emergency replies never depend on it.
+    // Structured without early returns so the conferencing enforcement below
+    // always runs (known-tongue must still conference; task: desired = !enabled,
+    // OR known => conference).
     try {
       const peer = ari.bridgePeer(callId);
-      if (!peer || peer.role !== "operator") return;
-      const opChannel = ari.channelForCall(peer.callId);
-      if (!opChannel) return;
-      const profile = resolveProfile(callId, peer.callId);
-      if (!profile?.operator_id) return;
-      const tongue = effLang ?? prior ?? "Marathi";
-      if (isKnownTongue(tongue, profile.known_languages ?? [])) return;
-      const enabled = await isTranslationEnabled(callId);
-      if (enabled) {
-        const target = profile.default_language || deps.operatorLang;
-        await translateAndSpeak(opChannel, text, target, effLang);
-      } else if (!nudged.has(callId)) {
-        nudged.add(callId);
-        try {
-          deps.publish?.("translation.suggested", callId, {
-            call_id: callId,
-            caller_language: tongue,
-            operator_id: profile.operator_id,
-          });
-        } catch {
-          /* publish must never break the loop */
+      if (peer && peer.role === "operator") {
+        const opChannel = ari.channelForCall(peer.callId);
+        const profile = resolveProfile(callId, peer.callId);
+        if (opChannel && profile?.operator_id) {
+          const tongue = effLang ?? prior ?? "Marathi";
+          if (!isKnownTongue(tongue, profile.known_languages ?? [])) {
+            const enabled = await isTranslationEnabled(callId);
+            if (enabled) {
+              const target = profile.default_language || deps.operatorLang;
+              await translateAndSpeak(opChannel, text, target, effLang);
+            } else if (!nudged.has(callId)) {
+              nudged.add(callId);
+              try {
+                deps.publish?.("translation.suggested", callId, {
+                  call_id: callId,
+                  caller_language: tongue,
+                  operator_id: profile.operator_id,
+                });
+              } catch {
+                /* publish must never break the loop */
+              }
+            }
+          }
         }
       }
     } catch (err) {
       deps.log("warn", "translation rendition failed", { callId, err: String(err) });
+    }
+    // Conferencing enforcement for this caller call (desired = !toggle, OR
+    // known-tongue => conference). After the toggle read above so the 2s TTL
+    // cache is warm; mid-call flips move the leg within ~2s + utterance time.
+    // In-flight utterances already finished above (no preemption).
+    // Warn-never-break: never throws, never breaks the call loop.
+    try {
+      const peer = ari.bridgePeer(callId);
+      const tongue = effLang ?? prior ?? langByCall.get(callId);
+      await enforceConference(callId, tongue, peer?.callId);
+    } catch (err) {
+      deps.log("warn", "conference enforcement failed", { callId, err: String(err) });
+    }
+  }
+
+  /** Toggle-driven conferencing enforcement for a caller call.
+   *  Desired membership = !translationToggle OR known-tongue => conference;
+   *  only toggle ON + unknown tongue => separated. (Task shorthand
+   *  "desired = !enabled" is the unknown-tongue case; the known-tongue OR
+   *  satisfies the LOCKED direct-conference rule.)
+   *  Warn-never-break: missing ari/method, toggle fetch failure (defaults
+   *  false => conference), and add/remove failures all log and return. */
+  async function enforceConference(
+    callerCallId: string,
+    tongueHint?: string,
+    operatorCallIdHint?: string,
+  ): Promise<void> {
+    try {
+      const ariCtl = deps.ari() as unknown as {
+        setOperatorConferenced?: (id: string, conferenced: boolean) => Promise<void>;
+      } | null;
+      if (!ariCtl || typeof ariCtl.setOperatorConferenced !== "function") return;
+      if (!callerCallId) return;
+      const profile = resolveProfile(callerCallId, operatorCallIdHint);
+      const tongue = tongueHint ?? langByCall.get(callerCallId);
+      const known = profile?.operator_id ? isKnownTongue(tongue, profile.known_languages ?? []) : false;
+      let enabled = false;
+      try {
+        enabled = await isTranslationEnabled(callerCallId);
+      } catch (err) {
+        deps.log("warn", "conference toggle read failed", { callId: callerCallId, err: String(err) });
+        enabled = false;
+      }
+      const desired = !enabled || known;
+      try {
+        await ariCtl.setOperatorConferenced(callerCallId, desired);
+      } catch (err) {
+        deps.log("warn", "conference enforcement failed", { callId: callerCallId, desired, err: String(err) });
+      }
+    } catch (err) {
+      try {
+        deps.log("warn", "conference enforcement failed", { callId: callerCallId, err: String(err) });
+      } catch {
+        /* log must never throw */
+      }
     }
   }
 
@@ -281,6 +357,7 @@ export function createConversation(deps: ConversationDeps) {
     getOperatorProfile,
     clearCallState,
     isTranslationEnabled,
+    enforceConference,
     toggleCache,
     profileByCall,
     nudged,
